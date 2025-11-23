@@ -913,16 +913,21 @@ else:
 
 
 
-# ========== 侧边栏署名（LinkedIn） ==========
-st.sidebar.markdown(
-    """
-    <div style='text-align:center; padding-top: 2rem;'>
-        👨‍💻 Build by <b>c8geek</b>
-        <a href='https://www.linkedin.com/in/lingyu-maxwell-lai' target='_blank' title='LinkedIn'>
-            <img src='https://cdn.jsdelivr.net/gh/simple-icons/simple-icons/icons/linkedin.svg'
-                 width='18' style='vertical-align:middle; margin-left:6px;'/>
-        </a>
-    </div>
-    """,
-    unsafe_allow_html=True
+# ========== 署名（LinkedIn） ==========
+LINKEDIN_URL = "https://www.linkedin.com/in/lingyu-maxwell-lai"
+st.markdown(
+    f"""
+<div style="display:flex;align-items:center;gap:10px;margin-top:-6px;margin-bottom:8px;">
+  <div style="font-size:14px;color:#666;">
+    Builded by <strong>Maxwell Lai</strong>
+  </div>
+  <a href="{LINKEDIN_URL}" target="_blank" title="LinkedIn: Maxwell Lai"
+     style="display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;
+            border-radius:4px;background:#0A66C2;">
+    <img src="https://cdn.jsdelivr.net/gh/simple-icons/simple-icons/icons/linkedin.svg"
+         alt="LinkedIn" width="12" height="12" style="filter: invert(1);" />
+  </a>
+</div>
+""",
+    unsafe_allow_html=True,
 )
