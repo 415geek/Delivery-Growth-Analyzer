@@ -91,47 +91,53 @@ def fetch_google_dinein_menu(address: str) -> pd.DataFrame:
     return pd.DataFrame(columns=["name", "price", "category", "channel"])
 
 
-# ===================== Yelp API：地址 → 餐厅候选 ===================== #
-
-def is_restaurant_business(biz: dict) -> bool:
-    """根据 Yelp 类别判断是否为餐厅/食品相关。"""
-    cats = biz.get("categories", []) or []
-    aliases = [c.get("alias", "").lower() for c in cats]
-    titles = [c.get("title", "").lower() for c in cats]
-
-    if any(a in ("restaurants", "food") for a in aliases):
-        return True
-    if any("restaurant" in t or "餐厅" in t for t in titles):
-        return True
-    return False
-
+# ===================== Yelp：地址 → 餐厅候选 ===================== #
 
 def fetch_yelp_candidates_by_address(address: str, limit: int = 5):
     """
-    用地址在 Yelp 搜索出“这个地址附近的餐厅列表”，
-    相当于后端的地址自动补全 + 店铺确认。
+    稳定的地址 → Yelp 匹配：
+    1）用 Google Geocoding 把地址转成 (lat, lng)
+    2）用 Yelp API 搜索该坐标 150 米范围内的所有商家
+    3）不过滤类别，全部返回给用户挑选
     """
     if not YELP_API_KEY:
         return []
 
     headers = {"Authorization": f"Bearer {YELP_API_KEY}"}
     url = "https://api.yelp.com/v3/businesses/search"
-    params = {
-        "location": address,
-        "limit": limit,
-        "sort_by": "distance"
-    }
 
-    r = requests.get(url, headers=headers, params=params, timeout=15)
+    # 先用 Google 把地址变成坐标
+    lat, lng = google_geocode(address)
+
+    if lat is None or lng is None:
+        # geocode 失败，退回 location 文本搜索（不推荐但留作兜底）
+        search_params = {
+            "location": address,
+            "limit": limit,
+            "sort_by": "distance"
+        }
+    else:
+        # Yelp 用坐标搜索，半径设为 150m（基本锁定该街区）
+        search_params = {
+            "latitude": lat,
+            "longitude": lng,
+            "radius": 150,   # 单位：米
+            "limit": limit,
+            "sort_by": "distance"
+        }
+
+    r = requests.get(url, headers=headers, params=search_params, timeout=15)
     data = r.json()
     businesses = data.get("businesses", [])
     candidates = []
 
+    if not businesses:
+        return []
+
     for b in businesses:
-        if not is_restaurant_business(b):
-            continue
         display_address = ", ".join(b["location"].get("display_address", []))
         cats = [c["title"] for c in b.get("categories", [])]
+
         candidates.append(
             {
                 "id": b["id"],
@@ -144,7 +150,7 @@ def fetch_yelp_candidates_by_address(address: str, limit: int = 5):
                 "lat": b["coordinates"]["latitude"],
                 "lng": b["coordinates"]["longitude"],
                 "address": display_address,
-                "source": "yelp",   # 标记是 Yelp 来的
+                "source": "yelp",
             }
         )
 
@@ -610,7 +616,7 @@ if match_submitted:
     if not raw_address.strip():
         st.error("请输入餐厅地址。")
     else:
-        # 先用 Yelp 找附近餐厅
+        # 先用 Yelp 找附近餐厅（经纬度搜索）
         with st.spinner("正在根据地址匹配 Yelp 餐厅，请稍等..."):
             candidates = fetch_yelp_candidates_by_address(raw_address)
 
@@ -620,7 +626,7 @@ if match_submitted:
             if place:
                 types = place.get("types", []) or []
 
-                # 严格的餐厅类型判断
+                # 餐厅类型判断
                 primary_food_types = {
                     "restaurant",
                     "food",
@@ -632,8 +638,7 @@ if match_submitted:
                 is_primary = any(t in primary_food_types for t in types)
                 is_secondary = any(t in secondary_food_types for t in types)
 
-                if is_primary:
-                    # 用 Google 详情补全信息
+                if is_primary or is_secondary:
                     details = google_place_details(place["place_id"])
                     loc = place["geometry"]["location"]
 
@@ -651,26 +656,6 @@ if match_submitted:
                         "source": "google",  # 标记来源是 Google
                     }
                     candidates = [google_candidate]
-                elif is_secondary:
-                    # 弱餐饮类型（cafe/bar等），保守起见也可以给出，让用户判断要不要用
-                    details = google_place_details(place["place_id"])
-                    loc = place["geometry"]["location"]
-
-                    google_candidate = {
-                        "id": None,
-                        "name": details.get("name", place.get("name", "Unknown Business")),
-                        "rating": details.get("rating", None),
-                        "review_count": details.get("user_ratings_total", 0),
-                        "price_level": details.get("price_level", ""),
-                        "categories": types,
-                        "categories_str": ", ".join(types) if types else "Google Place",
-                        "lat": loc["lat"],
-                        "lng": loc["lng"],
-                        "address": details.get("formatted_address", raw_address),
-                        "source": "google",  # 依然标记 Google
-                    }
-                    candidates = [google_candidate]
-                # 否则：Google 也认为不是餐饮相关，就保持 candidates 为空
 
         st.session_state["confirmed_address"] = raw_address
         st.session_state["yelp_candidates"] = candidates
@@ -891,8 +876,8 @@ if start_diagnose:
                 st.dataframe(result["competitors"])
 
             st.info(
-                "当前版本：先由 Yelp 匹配餐厅，若失败则由 Google Places 兜底；"
-                "只有当 Yelp 和 Google 都无法识别为餐厅类型时，才会提示“该地址不是餐厅”。"
+                "当前版本：先由 Yelp + 坐标匹配餐厅，若失败则由 Google Places 兜底；"
+                "只有当 Yelp 和 Google 都无法识别为餐饮门店时，才会提示“该地址不是餐厅”。"
             )
 
         except Exception as e:
@@ -903,15 +888,13 @@ else:
         """
         ### 使用说明
         1. **先在上方输入地址并点击「匹配该地址下的餐厅」**：  
-           - 系统先用 Yelp 搜索附近餐厅；  
-           - 若 Yelp 没有结果，再用 Google Places 兜底，只接受类型为 restaurant/food 等的门店；  
+           - 系统先用 Google Geocode 获取坐标，再用 Yelp 搜索 150m 半径内门店；  
+           - 若 Yelp 没有结果，再用 Google Places 兜底，只接受餐饮相关类型；  
            - 你从候选列表中选择正确的那一家。  
         2. 若 Yelp 和 Google 均未识别为餐饮门店，则会提示“该地址不是餐厅地址”。  
         3. 选择好餐厅后，在第二步填入当前日均外卖单量与客单价，点击「开始诊断」，生成完整诊断报告。  
         """
     )
-
-
 
 # ========== 署名（LinkedIn） ==========
 LINKEDIN_URL = "https://www.linkedin.com/in/lingyu-maxwell-lai"
