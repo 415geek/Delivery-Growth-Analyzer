@@ -54,13 +54,13 @@ def google_geocode(address: str):
 
 
 def google_find_place(address: str):
-    """使用 Places Find Place API 找到 place_id。"""
+    """使用 Places Find Place API 找到 place_id + types。"""
     url = "https://maps.googleapis.com/maps/api/place/findplacefromtext/json"
     params = {
         "key": GOOGLE_API_KEY,
         "input": address,
         "inputtype": "textquery",
-        "fields": "place_id,name,geometry"
+        "fields": "place_id,name,geometry,types"
     }
     r = requests.get(url, params=params, timeout=15)
     data = r.json()
@@ -76,7 +76,7 @@ def google_place_details(place_id: str):
     params = {
         "place_id": place_id,
         "key": GOOGLE_API_KEY,
-        "fields": "name,rating,user_ratings_total,formatted_address"
+        "fields": "name,rating,user_ratings_total,formatted_address,price_level"
     }
     r = requests.get(url, params=params, timeout=15)
     return r.json().get("result", {})
@@ -144,6 +144,7 @@ def fetch_yelp_candidates_by_address(address: str, limit: int = 5):
                 "lat": b["coordinates"]["latitude"],
                 "lng": b["coordinates"]["longitude"],
                 "address": display_address,
+                "source": "yelp",   # 标记是 Yelp 来的
             }
         )
 
@@ -435,7 +436,7 @@ def compute_coverage_score():
 def compute_market_voice_score(yelp_info: dict, place_info: dict):
     """
     新增指标：市场声音（0–100）
-    综合 Yelp + Google 的评分 & 评论量，近似反映“用户在网上的真实反馈热度”。
+    综合 Yelp + Google 的评分 & 评论量。
     """
     tips = []
 
@@ -448,24 +449,20 @@ def compute_market_voice_score(yelp_info: dict, place_info: dict):
         g_rating = place_info.get("rating")
         g_reviews = place_info.get("user_ratings_total", 0)
 
-    # 简单规则：评分 + 评论量双因子
     score = 60.0
 
-    # Yelp 评分和评论
     if y_rating is not None:
-        score += (y_rating - 4.0) * 5      # 4 分视为基准
+        score += (y_rating - 4.0) * 5
         tips.append(f"Yelp 评分：**{y_rating:.1f}** 分，评论数约 **{y_reviews}** 条。")
     else:
         tips.append("Yelp 暂无评分数据。")
 
-    # Google 评分和评论
     if g_rating is not None:
         score += (g_rating - 4.0) * 5
         tips.append(f"Google 评分：**{g_rating:.1f}** 分，评论数约 **{g_reviews}** 条。")
     else:
         tips.append("Google 暂无评分数据或未收录。")
 
-    # 评论数量影响：评论越多，市场声音越强
     total_reviews = (y_reviews or 0) + (g_reviews or 0)
     if total_reviews < 50:
         score -= 5
@@ -475,7 +472,6 @@ def compute_market_voice_score(yelp_info: dict, place_info: dict):
         tips.append("总体线上评论量较多，品牌在本地有一定“存在感”，可以放大复购与口碑转介绍。")
 
     score = max(min(score, 100.0), 0.0)
-
     tips.append("当前版本暂未接入外卖平台（Doordash/UberEats）的独立评分，仅基于 Yelp + Google 做统一评估。")
 
     return score, tips
@@ -483,8 +479,7 @@ def compute_market_voice_score(yelp_info: dict, place_info: dict):
 
 def compute_growth_rate(menu_score, price_score, promo_score, comp_score, coverage_score, voice_score) -> float:
     """
-    汇总六大维度，计算“潜在增长率”（0~1），
-    逻辑：原来五个维度的权重总和保持 80%，新增“市场声音”占 20%。
+    六大维度加权。
     """
     weighted = (
         0.18 * menu_score +
@@ -507,7 +502,7 @@ def analyze_restaurant(address: str, avg_orders: float, avg_ticket: float, yelp_
     - yelp_business：用户在候选列表中选择的那家店
     """
     if not yelp_business:
-        raise RuntimeError("未提供有效的 Yelp 店铺信息。")
+        raise RuntimeError("未提供有效的 Yelp / Google 店铺信息。")
 
     yelp_info = yelp_business
 
@@ -615,8 +610,68 @@ if match_submitted:
     if not raw_address.strip():
         st.error("请输入餐厅地址。")
     else:
+        # 先用 Yelp 找附近餐厅
         with st.spinner("正在根据地址匹配 Yelp 餐厅，请稍等..."):
             candidates = fetch_yelp_candidates_by_address(raw_address)
+
+        # 如果 Yelp 没找到，再用 Google Places 兜底
+        if not candidates:
+            place = google_find_place(raw_address)
+            if place:
+                types = place.get("types", []) or []
+
+                # 严格的餐厅类型判断
+                primary_food_types = {
+                    "restaurant",
+                    "food",
+                    "meal_takeaway",
+                    "meal_delivery",
+                }
+                secondary_food_types = {"cafe", "bar", "bakery"}
+
+                is_primary = any(t in primary_food_types for t in types)
+                is_secondary = any(t in secondary_food_types for t in types)
+
+                if is_primary:
+                    # 用 Google 详情补全信息
+                    details = google_place_details(place["place_id"])
+                    loc = place["geometry"]["location"]
+
+                    google_candidate = {
+                        "id": None,
+                        "name": details.get("name", place.get("name", "Unknown Business")),
+                        "rating": details.get("rating", None),
+                        "review_count": details.get("user_ratings_total", 0),
+                        "price_level": details.get("price_level", ""),
+                        "categories": types,
+                        "categories_str": ", ".join(types) if types else "Google Place",
+                        "lat": loc["lat"],
+                        "lng": loc["lng"],
+                        "address": details.get("formatted_address", raw_address),
+                        "source": "google",  # 标记来源是 Google
+                    }
+                    candidates = [google_candidate]
+                elif is_secondary:
+                    # 弱餐饮类型（cafe/bar等），保守起见也可以给出，让用户判断要不要用
+                    details = google_place_details(place["place_id"])
+                    loc = place["geometry"]["location"]
+
+                    google_candidate = {
+                        "id": None,
+                        "name": details.get("name", place.get("name", "Unknown Business")),
+                        "rating": details.get("rating", None),
+                        "review_count": details.get("user_ratings_total", 0),
+                        "price_level": details.get("price_level", ""),
+                        "categories": types,
+                        "categories_str": ", ".join(types) if types else "Google Place",
+                        "lat": loc["lat"],
+                        "lng": loc["lng"],
+                        "address": details.get("formatted_address", raw_address),
+                        "source": "google",  # 依然标记 Google
+                    }
+                    candidates = [google_candidate]
+                # 否则：Google 也认为不是餐饮相关，就保持 candidates 为空
+
         st.session_state["confirmed_address"] = raw_address
         st.session_state["yelp_candidates"] = candidates
         st.session_state["selected_yelp_index"] = 0 if candidates else None
@@ -631,7 +686,9 @@ if candidates:
 
     def format_option(i):
         b = candidates[i]
-        return f"{b['name']} · {b['categories_str']} · ⭐ {b.get('rating', 'N/A')} · {b['address']}"
+        source = b.get("source", "yelp")
+        source_tag = "Yelp" if source == "yelp" else "Google"
+        return f"{b['name']} · {b['categories_str']} · ⭐ {b.get('rating', 'N/A')} · {b['address']} · {source_tag}"
 
     selected_index = st.radio(
         "匹配餐厅",
@@ -648,7 +705,7 @@ if candidates:
     )
 
 elif st.session_state["confirmed_address"]:
-    st.error("该地址附近未在 Yelp 找到餐厅业务，可能不是餐厅地址或未在 Yelp 上登记。")
+    st.error("该地址附近未在 Yelp / Google 找到餐厅业务，可能不是餐厅地址或未登记为餐饮门店。")
 
 
 # ===================== UI：第二步 输入业务数据 + 开始诊断 ===================== #
@@ -666,7 +723,7 @@ with st.form("diagnose_form"):
 
 if start_diagnose:
     if not selected_biz:
-        st.error("请先在上方匹配并选择一家餐厅。当前地址可能不是餐厅，或者 Yelp 上没有相关店铺。")
+        st.error("请先在上方匹配并选择一家餐厅。当前地址可能不是餐厅，或者 Yelp / Google 上没有相关店铺。")
     else:
         try:
             with st.spinner("正在基于 Yelp / Google / 外卖平台数据进行诊断..."):
@@ -705,11 +762,9 @@ if start_diagnose:
             st.subheader("🩺 分维度运营建议（点击展开查看详细分析）")
             for dim, tips in result["tips"].items():
                 with st.expander(f"{dim} · 诊断与分析概览"):
-                    # 通用提示
                     for t in tips:
                         st.markdown(f"- {t}")
 
-                    # 针对不同维度，补充更具体的“分析概览”
                     if dim == "竞对压力":
                         comp_df = result["competitors"]
                         if comp_df is not None and not comp_df.empty:
@@ -828,7 +883,7 @@ if start_diagnose:
                 else:
                     st.dataframe(result["menus"]["all"])
 
-            # 竞对列表（单独再给一块）
+            # 竞对列表
             st.subheader("🏁 附近竞对门店列表（来自 Yelp）")
             if result["competitors"].empty:
                 st.write("未获取到竞对数据。")
@@ -836,8 +891,8 @@ if start_diagnose:
                 st.dataframe(result["competitors"])
 
             st.info(
-                "当前版本：六大维度评分 + 每个维度可展开详细分析；"
-                "新增“市场声音”维度，帮助你把 Yelp/Google 的评价量化成可以讲给老板听的数字故事。"
+                "当前版本：先由 Yelp 匹配餐厅，若失败则由 Google Places 兜底；"
+                "只有当 Yelp 和 Google 都无法识别为餐厅类型时，才会提示“该地址不是餐厅”。"
             )
 
         except Exception as e:
@@ -848,10 +903,26 @@ else:
         """
         ### 使用说明
         1. **先在上方输入地址并点击「匹配该地址下的餐厅」**：  
-           系统会通过 Yelp 找到该地址附近的餐厅列表；你从候选列表中选择正确的那一家。  
-        2. 如果该地址附近没有餐厅，系统会直接提示“该地址不是餐厅”。  
-        3. 选择好餐厅后，在第二步填入当前日均外卖单量与客单价，点击「开始诊断」，生成：  
-           - 六大维度评分（菜单结构 / 定价 / 活动 / 竞对压力 / 覆盖圈层 / 市场声音）；  
-           - 每个维度点击展开后，可以看到更具体的数据分析 & 对策建议。  
+           - 系统先用 Yelp 搜索附近餐厅；  
+           - 若 Yelp 没有结果，再用 Google Places 兜底，只接受类型为 restaurant/food 等的门店；  
+           - 你从候选列表中选择正确的那一家。  
+        2. 若 Yelp 和 Google 均未识别为餐饮门店，则会提示“该地址不是餐厅地址”。  
+        3. 选择好餐厅后，在第二步填入当前日均外卖单量与客单价，点击「开始诊断」，生成完整诊断报告。  
         """
     )
+
+
+
+# ========== 侧边栏署名（LinkedIn） ==========
+st.sidebar.markdown(
+    """
+    <div style='text-align:center; padding-top: 2rem;'>
+        👨‍💻 Build by <b>c8geek</b>
+        <a href='https://www.linkedin.com/in/lingyu-maxwell-lai' target='_blank' title='LinkedIn'>
+            <img src='https://cdn.jsdelivr.net/gh/simple-icons/simple-icons/icons/linkedin.svg'
+                 width='18' style='vertical-align:middle; margin-left:6px;'/>
+        </a>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
