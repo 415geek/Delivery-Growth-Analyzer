@@ -247,7 +247,7 @@ def fetch_yelp_competitors(lat: float, lng: float, term: str = "", radius_m: int
 
 
 @st.cache_data(show_spinner=False)
-def search_duckduckgo(query: str, max_results: int = 3):
+def search_duckduckgo(query: str, max_results: int = 5):
     """
     使用 DuckDuckGo 的 HTML 结果页面做简单搜索。
     注意很多链接是 /l/?uddg=，需要解码成真实 URL。
@@ -281,20 +281,43 @@ def search_duckduckgo(query: str, max_results: int = 3):
 
 
 def find_delivery_links(restaurant_name: str, address: str):
-    """通过搜索找到 Doordash / UberEats 的店铺链接（尽力而为）。"""
+    """
+    通过多轮 DuckDuckGo 搜索增强查找 Doordash / UberEats 链接，
+    避免单一搜索失败导致“未上线外卖平台”的误判。
+    """
     dd_link, ue_link = None, None
-    query_base = f'"{restaurant_name}" {address}'
 
-    dd_results = search_duckduckgo(query_base + " site:doordash.com")
-    for link in dd_results:
-        if "doordash.com" in link:
-            dd_link = link
-            break
+    keywords = [
+        f'"{restaurant_name}" {address} Doordash',
+        f'"{restaurant_name}" {address}',
+        f'"{restaurant_name}" San Francisco Doordash',
+        f'"{restaurant_name}" delivery',
+        f'"{restaurant_name}" uber eats',
+        f'"{restaurant_name}" ubereats',
+    ]
 
-    ue_results = search_duckduckgo(query_base + " site:ubereats.com")
-    for link in ue_results:
-        if "ubereats.com" in link:
-            ue_link = link
+    def extract_dd(url: str):
+        if "doordash.com" in url:
+            if "uddg=" in url:
+                url = requests.utils.unquote(url.split("uddg=")[-1])
+            return url
+        return None
+
+    def extract_ue(url: str):
+        if "ubereats.com" in url:
+            if "uddg=" in url:
+                url = requests.utils.unquote(url.split("uddg=")[-1])
+            return url
+        return None
+
+    for kw in keywords:
+        results = search_duckduckgo(kw, max_results=8)
+        for r in results:
+            if not dd_link:
+                dd_link = extract_dd(r)
+            if not ue_link:
+                ue_link = extract_ue(r)
+        if dd_link and ue_link:
             break
 
     return dd_link, ue_link
@@ -452,19 +475,35 @@ def compute_pricing_score(df_dinein: pd.DataFrame, df_delivery: pd.DataFrame):
     return max(score, 0), tips
 
 
-def compute_promotion_score(has_dd_link: bool, has_ue_link: bool):
+def compute_promotion_score(has_dd_link: bool, has_ue_link: bool, yelp_categories=None):
+    """
+    活动体系评分 + 防误判机制：
+    如果 Yelp 类目里已经明确有 delivery/takeout，就默认视为已上线外卖平台，
+    避免因为搜索失败导致“完全没上平台”的错误结论。
+    """
     tips = []
+    score = 60.0
+
+    # 防误判：从 Yelp 类目推断是否已有外卖能力
+    if yelp_categories:
+        cat_str = ",".join([c.lower() for c in yelp_categories if isinstance(c, str)])
+        if "delivery" in cat_str or "takeout" in cat_str or "food delivery" in cat_str:
+            if not has_dd_link and not has_ue_link:
+                tips.append("Yelp 类目显示已支持外卖/打包，但抓取平台链接失败，暂按“已上线外卖渠道”处理。")
+            has_dd_link = True
+            has_ue_link = has_ue_link or True  # 至少认为有一个主平台
+
     if not has_dd_link and not has_ue_link:
         score = 45.0
-        tips.append("暂未发现 Doordash / UberEats 店铺链接，外卖渠道基础需要先补齐。")
+        tips.append("暂未检测到 Doordash / UberEats 店铺链接，外卖渠道基础可能不足（也可能是抓取失败，可人工核实）。")
     elif has_dd_link and has_ue_link:
         score = 70.0
         tips.append("已覆盖主流外卖平台，适合做分平台差异化优惠与老客复购活动。")
     else:
         score = 60.0
-        tips.append("外卖平台仅覆盖部分渠道，建议同步拓展至 Doordash + UberEats，并统一价格与活动策略。")
+        tips.append("外卖平台仅检测到部分渠道，建议同步拓展至 Doordash + UberEats，并统一价格与活动策略。")
 
-    tips.append("当前版本未读取具体活动内容，建议后续落地：首单减免、午晚高峰满减、老客券包等组合玩法，把一次性流量变成可复购用户。")
+    tips.append("当前版本未读取具体活动内容，可落地：首单减免、午晚高峰满减、老客券包等，把一次性流量变成可复购用户。")
     return score, tips
 
 
@@ -662,7 +701,7 @@ def build_standard_payload(address: str, result: dict) -> dict:
 
 def llm_deep_analysis(payload: dict) -> dict:
     """
-    使用 GPT-5 Responses API 进行深度分析。
+    使用 GPT Responses API 进行深度分析。
     新版 API 不支持 response_format，只能在 prompt 里强制模型输出 JSON。
     """
     if client is None:
@@ -675,7 +714,7 @@ def llm_deep_analysis(payload: dict) -> dict:
         }
 
     prompt = f"""
-你是一名北美餐饮 & 外卖运营专家，熟悉 DoorDash、UberEats、熊猫外卖、饭团外卖、中餐厅经营，擅长线上爬取外卖平台的菜单和餐厅的菜单做深度的分析
+你是一名北美餐饮 & 外卖运营专家，熟悉 DoorDash、UberEats、中餐厅经营。
 
 下面是该餐厅的结构化 JSON 信息：
 {json.dumps(payload, ensure_ascii=False, indent=2)}
@@ -702,13 +741,21 @@ def llm_deep_analysis(payload: dict) -> dict:
 只返回 JSON，不能出现代码块、注释、额外说明。
 """
 
-    resp = client.responses.create(
-        model="gpt-4.1",
-        input=prompt,
-        max_output_tokens=1500
-    )
-
-    raw_output = resp.output_text
+    try:
+        resp = client.responses.create(
+            model="gpt-4.1-mini",
+            input=prompt,
+            max_output_tokens=1500
+        )
+        raw_output = resp.output_text
+    except Exception as e:
+        return {
+            "overall_summary": f"调用大模型失败：{e}，当前仅展示规则引擎结果。",
+            "key_findings": [],
+            "prioritized_actions": [],
+            "risks": [],
+            "data_gaps": []
+        }
 
     # 尝试解析 JSON
     try:
@@ -779,7 +826,9 @@ def analyze_restaurant(address: str, avg_orders: float, avg_ticket: float,
     menu_score, menu_tips = compute_menu_structure_score(all_df)
     price_score, price_tips = compute_pricing_score(dinein_df, dd_df if not dd_df.empty else ue_df)
     promo_score, promo_tips = compute_promotion_score(
-        has_dd_link=dd_link is not None, has_ue_link=ue_link is not None
+        has_dd_link=dd_link is not None,
+        has_ue_link=ue_link is not None,
+        yelp_categories=yelp_info.get("categories", [])
     )
     comp_score, comp_tips = compute_competitor_score(comp_df, yelp_info.get("rating", None))
     coverage_score, coverage_tips = compute_coverage_score()
@@ -1010,7 +1059,7 @@ if start_diagnose:
                     for r in ai_analysis.get("risks", []):
                         st.markdown(f"- {r}")
 
-                    st.markdown("**数据缺口（建议补充）：**")
+                    st.markmarkdown("**数据缺口（建议补充）：**")
                     for g in ai_analysis.get("data_gaps", []):
                         st.markdown(f"- {g}")
 
@@ -1114,11 +1163,11 @@ if start_diagnose:
             if dl["doordash"]:
                 st.markdown(f"- ✅ Doordash：[{dl['doordash']}]({dl['doordash']})")
             else:
-                st.markdown("- ❌ 未发现 Doordash 店铺链接")
+                st.markdown("- ❌ 未解析到 Doordash 店铺链接（可能是搜索抓取失败）")
             if dl["ubereats"]:
                 st.markdown(f"- ✅ UberEats：[{dl['ubereats']}]({dl['ubereats']})")
             else:
-                st.markdown("- ❌ 未发现 UberEats 店铺链接")
+                st.markdown("- ❌ 未解析到 UberEats 店铺链接（可能是搜索抓取失败）")
 
             # 菜单数据
             st.subheader("📑 菜单数据（若解析成功）")
