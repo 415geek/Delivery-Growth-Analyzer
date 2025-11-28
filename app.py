@@ -703,7 +703,7 @@ def llm_deep_analysis(payload: dict) -> dict:
 """
 
     resp = client.responses.create(
-        model="gpt-5.1-mini",
+        model="gpt-4.1",
         input=prompt,
         max_output_tokens=1500
     )
