@@ -675,7 +675,7 @@ def llm_deep_analysis(payload: dict) -> dict:
         }
 
     prompt = f"""
-你是一名北美餐饮 & 外卖运营专家，熟悉 DoorDash、UberEats、中餐厅经营。
+你是一名北美餐饮 & 外卖运营专家，熟悉 DoorDash、UberEats、熊猫外卖、饭团外卖、中餐厅经营，擅长线上爬取外卖平台的菜单和餐厅的菜单做深度的分析
 
 下面是该餐厅的结构化 JSON 信息：
 {json.dumps(payload, ensure_ascii=False, indent=2)}
