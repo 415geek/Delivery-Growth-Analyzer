@@ -1,7 +1,7 @@
 import os
 import json
 import datetime
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs, unquote, quote_plus
 
 import numpy as np
 import pandas as pd
@@ -94,7 +94,6 @@ def google_find_place(input_text: str, prefer_restaurant: bool = False, ref_name
     if not candidates:
         return None
 
-    # 不强制餐饮就直接用第一个
     if not prefer_restaurant:
         return candidates[0]
 
@@ -208,7 +207,11 @@ def fetch_yelp_candidates_by_address(address: str, limit: int = 5):
 
 @st.cache_data(show_spinner=False)
 def fetch_yelp_competitors(lat: float, lng: float, term: str = "", radius_m: int = 600) -> pd.DataFrame:
-    """使用 Yelp 搜索附近竞对，默认半径 600m。"""
+    """
+    使用 Yelp 搜索附近竞对：
+    - 限定半径（默认 600m）
+    - 带 term 时，按菜系关键字匹配
+    """
     if not YELP_API_KEY:
         return pd.DataFrame()
 
@@ -218,7 +221,7 @@ def fetch_yelp_competitors(lat: float, lng: float, term: str = "", radius_m: int
         "latitude": lat,
         "longitude": lng,
         "radius": radius_m,
-        "limit": 10,
+        "limit": 20,
         "sort_by": "rating",
     }
     if term:
@@ -243,6 +246,11 @@ def fetch_yelp_competitors(lat: float, lng: float, term: str = "", radius_m: int
     df = pd.DataFrame(rows)
     if "distance_m" in df.columns:
         df["distance_km"] = df["distance_m"] / 1000.0
+
+    # 再按菜系做一次过滤（严格按菜系筛选竞对）
+    if term and "categories" in df.columns:
+        df = df[df["categories"].str.contains(term, case=False, na=False)]
+
     return df
 
 
@@ -280,10 +288,10 @@ def search_duckduckgo(query: str, max_results: int = 5):
     return links
 
 
-def find_delivery_links(restaurant_name: str, address: str):
+def find_delivery_links_auto(restaurant_name: str, address: str):
     """
-    通过多轮 DuckDuckGo 搜索增强查找 Doordash / UberEats 链接，
-    避免单一搜索失败导致“未上线外卖平台”的误判。
+    自动模式：通过多轮 DuckDuckGo 搜索增强查找 Doordash / UberEats 链接，
+    现在作为“兜底”，真实结果优先用用户手动粘贴的链接。
     """
     dd_link, ue_link = None, None
 
@@ -518,7 +526,7 @@ def compute_competitor_score(df_comp: pd.DataFrame, restaurant_rating: float):
     score = max(min(score, 100.0), 0.0)
 
     tips.append(
-        f"附近 600m 内共检测到 **{len(df_comp)}** 家同类竞对门店，平均评分约 **{avg_comp_rating:.1f}** 分。"
+        f"附近同菜系 600m 内共检测到 **{len(df_comp)}** 家竞对门店，平均评分约 **{avg_comp_rating:.1f}** 分。"
     )
     if diff >= 0.2:
         tips.append(f"本店 Yelp 评分 **{restaurant_rating:.1f}**，高于竞对均值 {avg_comp_rating:.1f}，口碑具备优势，可以在外卖详情页更突出。")
@@ -530,7 +538,7 @@ def compute_competitor_score(df_comp: pd.DataFrame, restaurant_rating: float):
     if "distance_km" in df_comp.columns and not df_comp["distance_km"].isna().all():
         tips.append(
             f"已检测到的竞对距离本店约 **{df_comp['distance_km'].min():.2f}–{df_comp['distance_km'].max():.2f} km**，"
-            "意味着用户在同一配送半径内有多家可选。"
+            "在同一道菜系内竞争比较直接。"
         )
 
     return score, tips
@@ -602,7 +610,33 @@ def compute_growth_rate(menu_score, price_score, promo_score, comp_score, covera
     return growth_rate
 
 
-# ===================== 标准化 Schema + LLM 分析 ===================== #
+# ===================== 菜系推断 & 标准化 Schema + LLM 分析 ===================== #
+
+def infer_primary_cuisine(yelp_info: dict):
+    """根据 Yelp categories 推一个“主菜系”，用于筛选竞对。"""
+    cats = yelp_info.get("categories", []) or []
+    if not cats:
+        return None
+
+    priority_keywords = [
+        "Chinese", "Szechuan", "Dongbei", "Taiwanese",
+        "Korean", "Japanese", "Sushi",
+        "Thai", "Vietnamese", "Indian",
+        "Mediterranean", "Greek",
+        "Italian", "Pizza",
+        "Mexican", "Latin",
+        "American", "Burgers", "Sandwiches"
+    ]
+
+    # 先按关键字匹配
+    for cat in cats:
+        for kw in priority_keywords:
+            if kw.lower() in cat.lower():
+                return kw
+
+    # 否则用第一个 category 的第一个单词
+    return cats[0].split("/")[0]
+
 
 def build_standard_payload(address: str, result: dict) -> dict:
     """把规则引擎的 result 映射成标准化 JSON 结构，喂给大模型。"""
@@ -611,6 +645,7 @@ def build_standard_payload(address: str, result: dict) -> dict:
     menus = result.get("menus", {}) or {}
     all_df = menus.get("all")
     comp_df = result.get("competitors")
+    cuisine = result.get("cuisine")
 
     # 菜单统计
     total_items = int(len(all_df)) if all_df is not None else 0
@@ -646,7 +681,8 @@ def build_standard_payload(address: str, result: dict) -> dict:
             "name": yi.get("name") or gi.get("name"),
             "address": yi.get("address") or gi.get("formatted_address") or address,
             "lat": yi.get("lat"),
-            "lng": yi.get("lng")
+            "lng": yi.get("lng"),
+            "cuisine": cuisine,
         },
         "online_presence": {
             "yelp": {
@@ -668,6 +704,10 @@ def build_standard_payload(address: str, result: dict) -> dict:
             "ubereats": {
                 "has_link": bool(result["delivery_links"].get("ubereats")),
                 "url": result["delivery_links"].get("ubereats")
+            },
+            "other": {
+                "has_link": bool(result["delivery_links"].get("other")),
+                "url": result["delivery_links"].get("other")
             }
         },
         "menu": {
@@ -687,7 +727,8 @@ def build_standard_payload(address: str, result: dict) -> dict:
         "competition": {
             "num_competitors": num_competitors,
             "avg_rating": avg_comp_rating,
-            "median_rating": med_comp_rating
+            "median_rating": med_comp_rating,
+            "cuisine_filter": cuisine
         },
         "scores": result.get("scores", {}),
         "growth_estimation": {
@@ -714,9 +755,9 @@ def llm_deep_analysis(payload: dict) -> dict:
         }
 
     prompt = f"""
-你是一名北美餐饮 & 外卖运营专家，熟悉 DoorDash、UberEats、中餐厅经营。
+你是一名北美餐饮 & 外卖运营专家，熟悉 DoorDash、UberEats、中餐厅经营，也懂竞对分析。
 
-下面是该餐厅的结构化 JSON 信息：
+下面是该餐厅的结构化 JSON 信息（注意：竞对已按菜系和距离筛选，而不是随机附近门店）：
 {json.dumps(payload, ensure_ascii=False, indent=2)}
 
 请基于以上信息输出餐厅的深度诊断结果。
@@ -783,18 +824,30 @@ def llm_deep_analysis_cached(payload_json_str: str) -> dict:
 
 # ===================== 核心分析管线 ===================== #
 
-def analyze_restaurant(address: str, avg_orders: float, avg_ticket: float,
-                       yelp_business: dict, fast_mode: bool = False):
+def analyze_restaurant(
+    address: str,
+    avg_orders: float,
+    avg_ticket: float,
+    yelp_business: dict,
+    fast_mode: bool = False,
+    manual_dd: str = None,
+    manual_ue: str = None,
+    manual_other: str = None
+):
     """
     主入口：
     - address：用户输入的地址
     - yelp_business：用户在候选列表中选择的店
     - fast_mode：True 时跳过菜单抓取和 LLM，只用于规则层面快速评估
+    - manual_*：用户手动粘贴的各平台/点餐链接（优先使用）
     """
     if not yelp_business:
         raise RuntimeError("未提供有效的 Yelp / Google 店铺信息。")
 
     yelp_info = yelp_business
+
+    # 菜系推断（用于竞对筛选 & 深度分析）
+    cuisine = infer_primary_cuisine(yelp_info)
 
     # 让 Google 更精确：店名 + 地址
     place_query = f"{yelp_info['name']} {address}"
@@ -803,17 +856,37 @@ def analyze_restaurant(address: str, avg_orders: float, avg_ticket: float,
     if place and place.get("place_id"):
         place_info = google_place_details(place["place_id"])
 
-    # 竞对（Yelp）
-    comp_df = fetch_yelp_competitors(yelp_info["lat"], yelp_info["lng"])
+    # 竞对（Yelp，严格同菜系）
+    if cuisine:
+        comp_df = fetch_yelp_competitors(yelp_info["lat"], yelp_info["lng"], term=cuisine)
+    else:
+        comp_df = fetch_yelp_competitors(yelp_info["lat"], yelp_info["lng"])
 
     # 菜单 & 外卖渠道
     dinein_df = fetch_google_dinein_menu(address)  # 目前为空占位
 
+    manual_dd = manual_dd.strip() if manual_dd else None
+    manual_ue = manual_ue.strip() if manual_ue else None
+    manual_other = manual_other.strip() if manual_other else None
+
     if fast_mode:
-        dd_link = ue_link = None
-        dd_df = ue_df = pd.DataFrame(columns=["name", "price", "category", "channel", "tags"])
+        # 快速模式：不做自动搜索，只吃手动粘贴的链接
+        dd_link = manual_dd
+        ue_link = manual_ue
     else:
-        dd_link, ue_link = find_delivery_links(yelp_info["name"], yelp_info["address"])
+        # 先自动搜索
+        auto_dd, auto_ue = find_delivery_links_auto(yelp_info["name"], yelp_info["address"])
+        # 有手动粘贴，则覆盖自动结果
+        dd_link = manual_dd or auto_dd
+        ue_link = manual_ue or auto_ue
+
+    other_link = manual_other  # 其他点餐链接只来自用户粘贴
+
+    # 菜单解析（目前只针对 Doordash / UberEats）
+    if fast_mode:
+        dd_df = pd.DataFrame(columns=["name", "price", "category", "channel", "tags"])
+        ue_df = pd.DataFrame(columns=["name", "price", "category", "channel", "tags"])
+    else:
         dd_df = parse_doordash_menu(dd_link)
         ue_df = parse_ubereats_menu(ue_link)
 
@@ -849,7 +922,8 @@ def analyze_restaurant(address: str, avg_orders: float, avg_ticket: float,
         "competitors": comp_df,
         "delivery_links": {
             "doordash": dd_link,
-            "ubereats": ue_link
+            "ubereats": ue_link,
+            "other": other_link,
         },
         "menus": {
             "dinein": dinein_df,
@@ -879,6 +953,7 @@ def analyze_restaurant(address: str, avg_orders: float, avg_ticket: float,
         "revenue_uplift_daily": revenue_uplift_daily,
         "revenue_uplift_monthly": revenue_uplift_monthly,
         "fast_mode": fast_mode,
+        "cuisine": cuisine,
     }
 
     return result
@@ -991,6 +1066,12 @@ with st.form("diagnose_form"):
 
     fast_mode = st.checkbox("⚡ 快速诊断模式（跳过菜单抓取 & 大模型分析，提升速度）", value=True)
 
+    st.markdown("#### 🔗 可选：手动粘贴外卖/点餐链接（有则优先使用）")
+    with st.expander("展开填写外卖平台 / 点餐链接（推荐从 Google『Order online』页面复制）"):
+        manual_dd = st.text_input("Doordash 链接（可选）")
+        manual_ue = st.text_input("UberEats 链接（可选）")
+        manual_other = st.text_input("其他带菜单的在线点餐链接（可选，如自家点餐页 / Chowbus / 熊猫外卖等）")
+
     start_diagnose = st.form_submit_button("🚀 开始诊断")
 
 if start_diagnose:
@@ -1005,6 +1086,9 @@ if start_diagnose:
                     avg_ticket,
                     yelp_business=selected_biz,
                     fast_mode=fast_mode,
+                    manual_dd=manual_dd,
+                    manual_ue=manual_ue,
+                    manual_other=manual_other,
                 )
 
             # 顶部 KPI
@@ -1017,6 +1101,13 @@ if start_diagnose:
                 st.metric("优化后日外卖营业额（预测）", f"${result['potential_daily_revenue']:.0f}")
             with col_c:
                 st.metric("月度可提升外卖营业额（预测）", f"+${result['revenue_uplift_monthly']:.0f}")
+
+            cuisine = result.get("cuisine")
+            if cuisine:
+                st.write(
+                    f"系统推断本店主菜系为 **{cuisine}**，"
+                    f"竞对分析基于“附近 + 同菜系”门店，而不是随机附近餐厅。"
+                )
 
             st.write(
                 f"综合菜单结构、定价策略、活动体系、竞对压力、覆盖圈层与市场声音，"
@@ -1059,7 +1150,7 @@ if start_diagnose:
                     for r in ai_analysis.get("risks", []):
                         st.markdown(f"- {r}")
 
-                    st.markmarkdown("**数据缺口（建议补充）：**")
+                    st.markdown("**数据缺口（建议补充）：**")
                     for g in ai_analysis.get("data_gaps", []):
                         st.markdown(f"- {g}")
 
@@ -1078,7 +1169,7 @@ if start_diagnose:
                     if dim == "竞对压力":
                         comp_df = result["competitors"]
                         if comp_df is not None and not comp_df.empty:
-                            st.markdown("**附近竞对概览：**")
+                            st.markdown("**同菜系附近竞对概览：**")
                             st.write(
                                 f"- 竞对数量：**{len(comp_df)}** 家\n"
                                 f"- 评分中位数：**{comp_df['rating'].median():.1f}**\n"
@@ -1093,7 +1184,7 @@ if start_diagnose:
                                 .head(5)[["name", "rating", "review_count", "price_level", "distance_km", "categories"]]
                             )
                         else:
-                            st.write("未获取到竞对数据。")
+                            st.write("未获取到同菜系竞对数据。")
 
                     if dim == "菜单结构":
                         all_df = result["menus"]["all"]
@@ -1160,14 +1251,16 @@ if start_diagnose:
             # 外卖平台链接
             st.subheader("🚚 外卖平台覆盖情况")
             dl = result["delivery_links"]
-            if dl["doordash"]:
+            if dl.get("doordash"):
                 st.markdown(f"- ✅ Doordash：[{dl['doordash']}]({dl['doordash']})")
             else:
-                st.markdown("- ❌ 未解析到 Doordash 店铺链接（可能是搜索抓取失败）")
-            if dl["ubereats"]:
+                st.markdown("- ❌ 未解析到 Doordash 店铺链接（可在上方手动粘贴覆盖）")
+            if dl.get("ubereats"):
                 st.markdown(f"- ✅ UberEats：[{dl['ubereats']}]({dl['ubereats']})")
             else:
-                st.markdown("- ❌ 未解析到 UberEats 店铺链接（可能是搜索抓取失败）")
+                st.markdown("- ❌ 未解析到 UberEats 店铺链接（可在上方手动粘贴覆盖）")
+            if dl.get("other"):
+                st.markdown(f"- ✅ 其他点餐链接：[{dl['other']}]({dl['other']})")
 
             # 菜单数据
             st.subheader("📑 菜单数据（若解析成功）")
@@ -1194,15 +1287,15 @@ if start_diagnose:
                     st.dataframe(result["menus"]["all"])
 
             # 竞对列表
-            st.subheader("🏁 附近竞对门店列表（来自 Yelp）")
+            st.subheader("🏁 同菜系竞对门店列表（来自 Yelp）")
             if result["competitors"].empty:
-                st.write("未获取到竞对数据。")
+                st.write("未获取到同菜系竞对数据。")
             else:
                 st.dataframe(result["competitors"])
 
             st.info(
                 "当前版本：先由 Yelp + 坐标匹配餐厅，若失败则由 Google Places 兜底；"
-                "只有当 Yelp 和 Google 都无法识别为餐饮门店时，才会提示“该地址不是餐厅”。"
+                "竞对基于“附近 + 同菜系”筛选；如系统未能自动抓到外卖链接，可在第二步中手动粘贴覆盖。"
             )
 
         except Exception as e:
@@ -1214,8 +1307,11 @@ else:
         ### 使用说明
         1. 在上方输入餐厅地址并点击「匹配该地址下的餐厅」  
         2. 从候选列表中选中你的餐厅  
-        3. 输入当前日均外卖单量 & 客单价，选择是否开启⚡快速诊断模式，点击「开始诊断」  
-        4. 快速模式下只看基础盘子；关闭快速模式则会抓菜单 + 调大模型出一份深度报告  
+        3. 在第二步填入当前日均外卖单量 & 客单价  
+        4. 如有 Doordash/UberEats/自家点餐链接，可在「手动粘贴外卖/点餐链接」中直接复制粘贴  
+        5. 选择是否开启⚡快速诊断模式，点击「开始诊断」  
+           - 快速模式：只算基础分 + 竞对  
+           - 关闭快速模式：会尝试解析菜单，并调用大模型做深度分析  
         """
     )
 
