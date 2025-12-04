@@ -303,44 +303,6 @@ def infer_rank_from_serpapi(
     return None
 
 # =========================
-# ChatGPT 调用封装（带 fallback）
-# =========================
-
-def call_llm_safe(messages: list) -> str:
-    """
-    优先尝试 gpt-4.1-mini，403/模型无权限时自动退回 gpt-4o-mini。
-    """
-    if client is None:
-        return "未配置 OPENAI_API_KEY，无法调用 ChatGPT。"
-
-    # 首选模型
-    primary_model = "gpt-4.1-mini"
-    fallback_model = "gpt-4o-mini"
-
-    # 先试 primary
-    try:
-        resp = client.chat.completions.create(
-            model=primary_model,
-            messages=messages,
-            temperature=0.4,
-        )
-        return resp.choices[0].message.content
-    except Exception as e:
-        # 打个 debug 提示在前端
-        st.warning(f"使用 {primary_model} 失败，自动切换到 {fallback_model}。错误：{e}")
-
-    # 再试 fallback
-    try:
-        resp = client.chat.completions.create(
-            model=fallback_model,
-            messages=messages,
-            temperature=0.4,
-        )
-        return resp.choices[0].message.content
-    except Exception as e:
-        return f"调用 ChatGPT 失败：{e}"
-
-# =========================
 # ChatGPT 深度分析函数
 # =========================
 
@@ -435,12 +397,16 @@ def llm_deep_analysis(
 请用小标题 + 列表形式输出，语气务实、接地气，面向湾区/北美华人餐厅老板。
 """
 
-    messages = [
-        {"role": "system", "content": system_msg},
-        {"role": "user", "content": user_msg},
-    ]
+    completion = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ],
+        temperature=0.4,
+    )
 
-    return call_llm_safe(messages)
+    return completion.choices[0].message.content
 
 # =========================
 # 主界面：1 地址 → 候选餐厅
@@ -771,17 +737,20 @@ if candidate_places and selected_place_id and st.session_state["run_analysis"]:
     else:
         if st.button("🤖 生成 AI 深度分析报告"):
             with st.spinner("正在调用 ChatGPT 分析..."):
-                ai_report = llm_deep_analysis(
-                    place_detail=place_detail,
-                    gbp_result=gbp_result,
-                    web_result=web_result,
-                    competitors_df=competitors_df,
-                    rank_results=rank_results,
-                    monthly_search_volume=monthly_search_volume,
-                    dine_in_aov=dine_in_aov,
-                    delivery_aov=delivery_aov,
-                )
-                st.markdown(ai_report)
+                try:
+                    ai_report = llm_deep_analysis(
+                        place_detail=place_detail,
+                        gbp_result=gbp_result,
+                        web_result=web_result,
+                        competitors_df=competitors_df,
+                        rank_results=rank_results,
+                        monthly_search_volume=monthly_search_volume,
+                        dine_in_aov=dine_in_aov,
+                        delivery_aov=delivery_aov,
+                    )
+                    st.markdown(ai_report)
+                except Exception as e:
+                    st.error(f"调用 ChatGPT API 出错：{e}")
 
 # ========== 署名（LinkedIn） ==========
 LINKEDIN_URL = "https://www.linkedin.com/in/lingyu-maxwell-lai"
