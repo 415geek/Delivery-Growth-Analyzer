@@ -31,9 +31,9 @@ st.title("Aurainsight 餐馆增长诊断")
 st.write(
     "针对北美餐馆老板的一键在线体检：\n"
     "- 只需输入地址，自动匹配你的餐厅\n"
-    "- 自动抓取附近竞争对手\n"
+    "- 自动扫描附近竞争对手\n"
     "- 估算堂食 / 外卖的潜在流失营收\n"
-    "- 尝试抓取官网 / 第三方平台菜单，结合作品级 ChatGPT 报告做多维菜系 & 菜单结构分析"
+    "- 抓取官网 / 第三方平台菜单，结合 ChatGPT 做多维菜系 & 菜单结构 & 运营分析"
 )
 
 # 从 Streamlit Secrets 读取 API 密钥
@@ -57,6 +57,9 @@ if "candidate_places" not in st.session_state:
     st.session_state["candidate_places"] = []
 if "selected_index" not in st.session_state:
     st.session_state["selected_index"] = 0
+# 记录是否已经跑过完整分析，供 AI 按钮使用
+if "analysis_ready" not in st.session_state:
+    st.session_state["analysis_ready"] = False
 
 # =========================
 # 工具函数（带缓存）
@@ -135,7 +138,6 @@ def fetch_html(url: str) -> Optional[str]:
     """
     先用普通 requests 抓一次；
     如果失败，并且环境支持 requests_html，再尝试 headless 渲染。
-    Streamlit Cloud 上如果缺 lxml 相关依赖，会自动关闭 headless，不会报错。
     """
     headers = {
         "User-Agent": (
@@ -146,7 +148,7 @@ def fetch_html(url: str) -> Optional[str]:
         "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8",
     }
 
-    # 第一次尝试：普通 HTTP 请求
+    # 普通请求
     try:
         resp = requests.get(url, headers=headers, timeout=15)
         if resp.status_code < 400 and "text/html" in resp.headers.get("Content-Type", ""):
@@ -154,7 +156,7 @@ def fetch_html(url: str) -> Optional[str]:
     except Exception:
         pass
 
-    # 第二次（可选）尝试：headless 浏览器执行 JS
+    # headless 渲染（可选）
     if not HAS_REQUESTS_HTML:
         return None
 
@@ -314,8 +316,10 @@ def estimate_revenue_loss(
         current_factor = 1.0
     elif rank_bucket == "4-10":
         current_factor = 0.4
-    else:
+    elif rank_bucket == "11+":
         current_factor = 0.1
+    else:  # none / unknown
+        current_factor = 0.0
 
     current_customers = ideal_customers * current_factor
     potential_extra_customers = ideal_customers - current_customers
@@ -542,11 +546,11 @@ def llm_deep_analysis(
    - 根据菜单文本，分析：
      - 热门品类（如主食类、招牌菜、套餐、炸鸡、甜品等）
      - 人均价位区间、主力价格带（例如：多数主菜集中在 $15–$22）
-     - 是否存在明显的“利润杀手”（价格偏低但制作复杂、毛利低的菜）
+     - 是否存在明显的“利润杀手”（价格偏低但制作复杂、毛利低的菜）。
 
 3. **线上曝光 & 竞争态势解读**
    - 结合 GBP 评分、网站得分、关键词排名结果，判断：
-     - 目前在本地搜索中的位置（落后程度、有无机会冲击 Top 3）
+     - 目前在本地搜索中的位置（落后程度、有无机会冲击 Top 3）。
      - 和 3–5 家核心竞品相比的明显短板和优势。
 
 4. **外卖平台机会点（如果菜单里出现外卖平台链接）**
@@ -555,9 +559,9 @@ def llm_deep_analysis(
 
 5. **接下来 30 天可执行的行动清单**
    - 用清单方式给出 5–8 条“餐馆老板能听懂、能马上执行”的改进建议：
-     - Google 资料 & 网站内容优先级
-     - 菜单结构和定价优化
-     - 外卖活动 & 转化率优化建议
+     - Google 资料 & 网站内容优先级；
+     - 菜单结构和定价优化；
+     - 外卖活动 & 转化率优化建议。
 
 要求：
 - 尽量用短句和项目符号，方便餐厅老板阅读和执行。
@@ -613,7 +617,7 @@ candidate_places = st.session_state["candidate_places"]
 selected_place_id: Optional[str] = None
 place_label_list: List[str] = []
 
-run_btn = False  # 先默认 False，避免未定义
+run_btn = False  # 默认 False，避免未定义
 
 if candidate_places:
     st.markdown("## 2️⃣ 选择你的餐厅 & 填写关键业务参数")
@@ -672,14 +676,21 @@ if candidate_places:
     )
 
     run_btn = st.button("🚀 运行分析")
+
+    # 只要点过一次“运行分析”，就记下来，后面点 AI 按钮也能复用分析逻辑
+    if run_btn:
+        st.session_state["analysis_ready"] = True
+
 else:
     st.info("先输入地址并点击“根据地址查找附近餐厅”。")
 
 # =========================
-# 3️⃣ 主分析逻辑
+# 3️⃣ 主分析逻辑（运行分析按钮 or 已经分析过）
 # =========================
 
-if candidate_places and selected_place_id and run_btn:
+if candidate_places and selected_place_id and (
+    run_btn or st.session_state.get("analysis_ready", False)
+):
     with st.spinner("获取餐厅详情（Google Place Details）..."):
         place_detail = google_place_details(GOOGLE_API_KEY, selected_place_id)
 
@@ -829,7 +840,7 @@ if candidate_places and selected_place_id and run_btn:
         "- 60 分以上：相对健康，可以开始玩精细化运营和活动。"
     )
 
-    st.markdown("## 8️⃣ ChatGPT 菜系 & 菜单 & 运营深度分析")
+    st.markdown("## 8️⃣ ChatGPT 菜系 & 菜单结构 & 运营深度分析")
 
     auto_menu_urls = discover_menu_urls(place_detail, website_html)
     auto_menu_urls_str = "\n".join(auto_menu_urls)
@@ -869,7 +880,6 @@ if candidate_places and selected_place_id and run_btn:
     ai_btn = st.button("✨ 生成 AI 深度分析报告")
 
     if ai_btn:
-        # 调试提示：至少证明按钮真的被触发了
         st.info("已收到生成请求，正在调用 ChatGPT ...")
 
         if client is None:
