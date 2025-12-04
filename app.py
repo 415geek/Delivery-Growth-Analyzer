@@ -397,17 +397,28 @@ def llm_deep_analysis(
 请用小标题 + 列表形式输出，语气务实、接地气，面向湾区/北美华人餐厅老板。
 """
 
-    completion = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": user_msg},
-        ],
-        temperature=0.4,
-    )
+def call_llm_safe(messages):
+    try:
+        # 首选：gpt-4.1-mini
+        return client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=messages,
+            temperature=0.4,
+        ).choices[0].message.content
 
-    return completion.choices[0].message.content
+    except Exception:
+        # 没权限则 fallback
+        return client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            temperature=0.4,
+        ).choices[0].message.content
 
+completion_text = call_llm_safe([
+    {"role": "system", "content": system_msg},
+    {"role": "user", "content": user_msg},
+])
+return completion_text
 # =========================
 # 主界面：1 地址 → 候选餐厅
 # =========================
