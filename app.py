@@ -14,7 +14,7 @@ from openai import OpenAI
 # 基本配置 & Secrets
 # =========================
 st.set_page_config(
-    page_title="Restaurant Competitor & Menu Analyzer",
+    page_title="Aurainsight 餐馆增长诊断",
     layout="wide",
 )
 
@@ -22,6 +22,9 @@ GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY", "")
 SERPAPI_KEY = st.secrets.get("SERPAPI_KEY", "")
 YELP_API_KEY = st.secrets.get("YELP_API_KEY", "")
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")
+HEADLESS_ENABLED_RAW = st.secrets.get("HEADLESS_ENABLED", "false")
+
+HEADLESS_ENABLED = str(HEADLESS_ENABLED_RAW).strip().lower() in ["1", "true", "yes"]
 
 if not GOOGLE_API_KEY:
     st.error("缺少 GOOGLE_API_KEY，请先在 Streamlit Secrets 中配置后再刷新。")
@@ -34,7 +37,7 @@ if OPENAI_API_KEY:
 # =========================
 # 页面标题
 # =========================
-st.title("🍜 Restaurant Local SEO + Menu Analyzer")
+st.title("Aurainsight 餐馆增长诊断")
 
 st.write(
     "面向餐厅老板的一键体检：\n"
@@ -56,7 +59,7 @@ if "run_analysis" not in st.session_state:
     st.session_state["run_analysis"] = False
 
 # =========================
-# 工具函数（带缓存）
+# Google Maps 相关工具函数（带缓存）
 # =========================
 
 @st.cache_data(show_spinner=False)
@@ -107,17 +110,6 @@ def google_places_nearby(
     return result.get("results", [])
 
 @st.cache_data(show_spinner=False)
-def fetch_html(url: str) -> Optional[str]:
-    try:
-        headers = {"User-Agent": "Mozilla/5.0 (Restaurant-Analyzer)"}
-        resp = requests.get(url, headers=headers, timeout=15)
-        if resp.status_code == 200:
-            return resp.text
-        return None
-    except Exception:
-        return None
-
-@st.cache_data(show_spinner=False)
 def serpapi_google_maps_search(
     serpapi_key: str, query: str, lat: float, lng: float, zoom: float = 13.0
 ) -> Dict[str, Any]:
@@ -133,6 +125,163 @@ def serpapi_google_maps_search(
     resp = requests.get(url, params=params, timeout=30)
     resp.raise_for_status()
     return resp.json()
+
+# =========================
+# 菜单抓取：requests + 可选 headless 浏览器
+# =========================
+
+@st.cache_data(show_spinner=False)
+def fetch_html_requests(url: str) -> Optional[str]:
+    """常规 requests 抓取，宽松接受 3xx。"""
+    try:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8",
+        }
+        resp = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
+        if resp.status_code < 400:
+            return resp.text
+        st.warning(f"[菜单抓取] {url} 返回状态码 {resp.status_code}。")
+        return None
+    except Exception as e:
+        st.warning(f"[菜单抓取] 访问 {url} 出错：{e}")
+        return None
+
+@st.cache_data(show_spinner=False)
+def fetch_html_headless(url: str) -> Optional[str]:
+    """
+    使用 Playwright 的 headless Chromium 抓页面内容。
+    需要在运行环境中安装：
+      pip install playwright
+      playwright install chromium
+    在 Streamlit Cloud 上可能无法使用，仅适合本地 / 自建服务器。
+    """
+    if not HEADLESS_ENABLED:
+        return None
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        st.warning("未安装 playwright，无法使用无头浏览器抓取。")
+        return None
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0 Safari/537.36"
+                ),
+                locale="en-US",
+            )
+            page = context.new_page()
+            page.goto(url, wait_until="networkidle", timeout=25000)
+            content = page.content()
+            browser.close()
+            return content
+    except Exception as e:
+        st.warning(f"[Headless 抓取] 访问 {url} 出错：{e}")
+        return None
+
+@st.cache_data(show_spinner=False)
+def fetch_html(url: str) -> Optional[str]:
+    """
+    统一入口：
+    1) 先尝试 requests
+    2) 不行再尝试 headless（如果启用且可用）
+    """
+    html = fetch_html_requests(url)
+    if html:
+        return html
+
+    # requests 抓不到，再试 headless
+    html2 = fetch_html_headless(url)
+    return html2
+
+def clean_text_block(text: str) -> str:
+    """简单清洗文本，去掉多余空白。"""
+    lines = [ln.strip() for ln in text.splitlines()]
+    lines = [ln for ln in lines if ln]
+    return "\n".join(lines)
+
+def extract_menu_text_from_html(html: str) -> str:
+    """
+    通用版菜单抓取：
+    - 移除 script/style
+    - 优先寻找包含价格符号/常见菜品关键词的行
+    - 不追求 100% 结构化，只要给 LLM 足够的半结构化信息
+    """
+    soup = BeautifulSoup(html, "lxml")
+
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+
+    raw_text = soup.get_text("\n", strip=True)
+    raw_text = clean_text_block(raw_text)
+
+    lines = raw_text.split("\n")
+    menu_lines = []
+
+    price_tokens = ["$", "￥", "£", "€"]
+    food_keywords = [
+        "chicken", "beef", "pork", "tofu", "noodle", "rice", "dumpling",
+        "soup", "fried", "braised", "spicy", "bbq", "curry",
+        "饭", "面", "粉", "鸡", "牛", "猪", "汤", "炒", "煎", "焗", "咖喱",
+    ]
+
+    for ln in lines:
+        l = ln.lower()
+        if any(p in ln for p in price_tokens) or any(k in l for k in food_keywords):
+            menu_lines.append(ln)
+
+    # 如果抓不到明显菜单线，就退回较长文本的一部分
+    if len(menu_lines) < 10:
+        menu_lines = lines
+
+    menu_text = "\n".join(menu_lines)
+    return menu_text[:6000]
+
+def build_menu_payload(menu_urls: List[str]) -> List[Dict[str, str]]:
+    """
+    根据用户输入的菜单 URL 列表，抓取文本并构造 LLM 使用的结构。
+    """
+    menus: List[Dict[str, str]] = []
+    for url in menu_urls:
+        url = url.strip()
+        if not url:
+            continue
+
+        html = fetch_html(url)
+        if not html:
+            menus.append(
+                {
+                    "source": urlparse(url).netloc or "unknown",
+                    "url": url,
+                    "status": "fetch_failed_or_blocked",
+                    "menu_text": "",
+                }
+            )
+            continue
+
+        menu_text = extract_menu_text_from_html(html)
+        status = "ok" if menu_text.strip() else "no_menu_detected"
+
+        menus.append(
+            {
+                "source": urlparse(url).netloc or "unknown",
+                "url": url,
+                "status": status,
+                "menu_text": menu_text,
+            }
+        )
+
+    return menus
 
 # =========================
 # 评分函数
@@ -302,85 +451,6 @@ def infer_rank_from_serpapi(
     return None
 
 # =========================
-# 菜单抓取相关函数
-# =========================
-
-def clean_text_block(text: str) -> str:
-    """简单清洗文本，去掉多余空白。"""
-    lines = [ln.strip() for ln in text.splitlines()]
-    lines = [ln for ln in lines if ln]
-    return "\n".join(lines)
-
-def extract_menu_text_from_html(html: str) -> str:
-    """
-    通用版菜单抓取：
-    - 移除 script/style
-    - 优先寻找包含价格符号/常见菜品关键词的行
-    - 不追求 100% 结构化，只要给 LLM 足够的半结构化信息
-    """
-    soup = BeautifulSoup(html, "lxml")
-
-    for tag in soup(["script", "style", "noscript"]):
-        tag.decompose()
-
-    raw_text = soup.get_text("\n", strip=True)
-    raw_text = clean_text_block(raw_text)
-
-    lines = raw_text.split("\n")
-    menu_lines = []
-
-    price_tokens = ["$", "￥", "£", "€"]
-    food_keywords = [
-        "chicken", "beef", "pork", "tofu", "noodle", "rice", "dumpling",
-        "soup", "fried", "braised", "spicy", "bbq", "curry",
-        "饭", "面", "粉", "鸡", "牛", "猪", "汤", "炒", "煎", "焗", "咖喱",
-    ]
-
-    for ln in lines:
-        l = ln.lower()
-        if any(p in ln for p in price_tokens) or any(k in l for k in food_keywords):
-            menu_lines.append(ln)
-
-    # 如果抓不到明显菜单线，就退回较长文本的一部分
-    if len(menu_lines) < 10:
-        menu_lines = lines
-
-    menu_text = "\n".join(menu_lines)
-    # 限制长度，避免 prompt 爆炸
-    return menu_text[:6000]
-
-def build_menu_payload(menu_urls: List[str]) -> List[Dict[str, str]]:
-    """
-    根据用户输入的菜单 URL 列表，抓取文本并构造 LLM 使用的结构。
-    """
-    menus: List[Dict[str, str]] = []
-    for url in menu_urls:
-        url = url.strip()
-        if not url:
-            continue
-        html = fetch_html(url)
-        if not html:
-            menus.append(
-                {
-                    "source": urlparse(url).netloc or "unknown",
-                    "url": url,
-                    "status": "fetch_failed",
-                    "menu_text": "",
-                }
-            )
-            continue
-        menu_text = extract_menu_text_from_html(html)
-        menus.append(
-            {
-                "source": urlparse(url).netloc or "unknown",
-                "url": url,
-                "status": "ok",
-                "menu_text": menu_text,
-            }
-        )
-    return menus
-
-# =========================
 # ChatGPT 封装 & 深度分析
 # =========================
 
@@ -425,15 +495,11 @@ def llm_deep_analysis(
     delivery_aov: float,
     menus: List[Dict[str, str]],
 ) -> str:
-    if client is None:
-        return "未配置 OPENAI_API_KEY，无法调用 ChatGPT。"
-
     comp_json = []
     if competitors_df is not None and not competitors_df.empty:
         sub = competitors_df.head(5)
         comp_json = sub.to_dict(orient="records")
 
-    # 只把每个菜单文本截断一下，防止太长
     menus_safe = []
     for m in menus:
         menus_safe.append(
@@ -887,7 +953,6 @@ if candidate_places and selected_place_id and st.session_state["run_analysis"]:
         with st.spinner("抓取菜单页面并提取菜品文本..."):
             menus = build_menu_payload(menu_urls)
 
-        # 给你一个简单预览，确认有抓到东西
         if menus:
             st.markdown("#### 菜单抓取预览（调试用）")
             preview_rows = []
@@ -904,6 +969,7 @@ if candidate_places and selected_place_id and st.session_state["run_analysis"]:
     else:
         st.info("未填写任何菜单链接，将只做线上曝光和网站层面的分析。")
 
+    ai_report = None
     if not OPENAI_API_KEY:
         st.warning("未配置 OPENAI_API_KEY，如需 AI 深度分析请在 Secrets 中添加。")
     else:
@@ -922,21 +988,10 @@ if candidate_places and selected_place_id and st.session_state["run_analysis"]:
                 )
                 st.markdown(ai_report)
 
-# ========== 署名（LinkedIn） ==========
-LINKEDIN_URL = "https://www.linkedin.com/in/lingyu-maxwell-lai"
-st.markdown(
-    f"""
-<div style="display:flex;align-items:center;gap:10px;margin-top:-6px;margin-bottom:8px;">
-  <div style="font-size:14px;color:#666;">
-    Builded by <strong>Maxwell Lai</strong>
-  </div>
-  <a href="{LINKEDIN_URL}" target="_blank" title="LinkedIn: Maxwell Lai"
-     style="display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;
-            border-radius:4px;background:#0A66C2;">
-    <img src="https://cdn.jsdelivr.net/gh/simple-icons/simple-icons/icons/linkedin.svg"
-         alt="LinkedIn" width="12" height="12" style="filter: invert(1);" />
-  </a>
-</div>
-""",
-    unsafe_allow_html=True,
-)
+    # 8. CTA：免费获取完整报告（WhatsApp）
+    st.markdown("## 8️⃣ 免费获取完整 Aurainsight 报告")
+
+    st.markdown(
+        """
+<div style="margin-top:10px; margin-bottom:20px;">
+  <a href="https
