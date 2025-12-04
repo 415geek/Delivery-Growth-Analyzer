@@ -9,8 +9,15 @@ import googlemaps
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 
-from requests_html import HTMLSession
 from openai import OpenAI
+
+# 尝试可选导入 headless 浏览器支持
+try:
+    from requests_html import HTMLSession  # 可能在某些环境缺依赖
+    HAS_REQUESTS_HTML = True
+except Exception:
+    HTMLSession = None
+    HAS_REQUESTS_HTML = False
 
 # =========================
 # 基本配置 & Secrets
@@ -127,7 +134,8 @@ def serpapi_google_maps_search(
 def fetch_html(url: str) -> Optional[str]:
     """
     先用普通 requests 抓一次；
-    如果效果不好，再尝试 headless 浏览器（requests-html + pyppeteer）渲染 JS。
+    如果失败，并且环境支持 requests_html，再尝试 headless 渲染。
+    Streamlit Cloud 上如果缺 lxml 相关依赖，会自动关闭 headless，不会报错。
     """
     headers = {
         "User-Agent": (
@@ -143,11 +151,16 @@ def fetch_html(url: str) -> Optional[str]:
         resp = requests.get(url, headers=headers, timeout=15)
         if resp.status_code < 400 and "text/html" in resp.headers.get("Content-Type", ""):
             return resp.text
-        st.warning(f"[菜单抓取] 普通请求效果一般，尝试 headless 渲染：{url}")
+        st.warning(f"[菜单抓取] 普通请求效果一般，状态码 {resp.status_code}。")
     except Exception as e:
-        st.warning(f"[菜单抓取] 普通请求出错：{e}，尝试 headless 渲染：{url}")
+        st.warning(f"[菜单抓取] 普通请求出错：{e}")
 
-    # 第二次尝试：headless 浏览器执行 JS
+    # 第二次（可选）尝试：headless 浏览器执行 JS
+    if not HAS_REQUESTS_HTML:
+        # 当前环境不支持 headless，就直接结束
+        st.info("当前运行环境不支持 headless 浏览器渲染，已退回普通抓取模式。")
+        return None
+
     try:
         session = HTMLSession()
         r = session.get(url, headers=headers, timeout=30)
@@ -156,7 +169,6 @@ def fetch_html(url: str) -> Optional[str]:
     except Exception as e:
         st.warning(f"[菜单抓取] headless 渲染失败：{e}")
         return None
-
 
 # =========================
 # 评分 & 计算函数
@@ -326,7 +338,6 @@ def infer_rank_from_serpapi(
             return idx
     return None
 
-
 # =========================
 # 菜单相关
 # =========================
@@ -335,7 +346,6 @@ def extract_menu_text_from_html(html: str) -> str:
     """从 HTML 中尽量提取出像菜单的内容（菜名 + 价格等）"""
     soup = BeautifulSoup(html, "lxml")
 
-    # 去掉明显噪音
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
 
@@ -344,7 +354,6 @@ def extract_menu_text_from_html(html: str) -> str:
         txt = el.get_text(" ", strip=True)
         if not txt:
             continue
-        # 简单规则：包含价格符号或者明显是菜名
         if any(x in txt for x in ["$", "¥"]) or any(
             kw in txt.lower()
             for kw in ["chicken", "beef", "pork", "noodle", "rice", "tofu", "dumpling", "soup"]
@@ -352,12 +361,10 @@ def extract_menu_text_from_html(html: str) -> str:
             if 3 <= len(txt) <= 120:
                 texts.append(txt)
 
-    # 如果筛不出来，就退化成整页文本前几千字符
     if not texts:
         full = soup.get_text(" ", strip=True)
         return full[:4000]
 
-    # 去重
     seen = set()
     deduped = []
     for t in texts:
@@ -415,11 +422,9 @@ def discover_menu_urls(place_detail: Dict[str, Any], website_html: Optional[str]
     if main_site:
         urls.add(main_site)
 
-    # 从 Google Maps 分享 URL 里也可能看到菜单
     if "url" in place_detail:
         urls.add(place_detail["url"])
 
-    # 如果有官网 HTML，解析其中的 <a> 标签
     if website_html:
         soup = BeautifulSoup(website_html, "lxml")
         for a in soup.find_all("a", href=True):
@@ -427,12 +432,10 @@ def discover_menu_urls(place_detail: Dict[str, Any], website_html: Optional[str]
             href_lower = href.lower()
             text = a.get_text(" ", strip=True).lower()
 
-            # 常见关键词
             if any(k in href_lower for k in ["menu", "order", "online-order", "order-online"]) or \
                any(k in text for k in ["menu", "order", "online order"]):
                 urls.add(href)
 
-            # 常见第三方平台域名
             for domain in [
                 "doordash.com",
                 "ubereats.com",
@@ -447,18 +450,13 @@ def discover_menu_urls(place_detail: Dict[str, Any], website_html: Optional[str]
 
     return list(urls)
 
-
 # =========================
 # ChatGPT 深度分析函数
 # =========================
 
 def call_llm_safe(messages: List[Dict[str, str]]) -> str:
-    """
-    简单的 LLM 调用封装：优先用 gpt-4.1-mini，失败就降级到 gpt-4o-mini。
-    """
     if client is None:
         return "未配置 OPENAI_API_KEY，无法调用 ChatGPT。"
-
     try:
         completion = client.chat.completions.create(
             model="gpt-4.1-mini",
@@ -572,7 +570,6 @@ def llm_deep_analysis(
     ]
     return call_llm_safe(messages)
 
-
 # =========================
 # 1️⃣ 输入地址，锁定餐厅
 # =========================
@@ -683,19 +680,16 @@ else:
 # =========================
 
 if candidate_places and selected_place_id and run_btn:
-    # 3.1 获取餐厅详情
     with st.spinner("获取餐厅详情（Google Place Details）..."):
         place_detail = google_place_details(GOOGLE_API_KEY, selected_place_id)
 
     st.success(f"已锁定餐厅：**{place_detail.get('name', 'Unknown')}**")
 
-    # 经纬度
     geometry = place_detail.get("geometry", {})
     location = geometry.get("location", {})
     center_lat = location.get("lat")
     center_lng = location.get("lng")
 
-    # 3.2 附近竞争对手
     with st.spinner("扫描附近 1.5 公里内的竞争对手..."):
         nearby_comp = google_places_nearby(
             GOOGLE_API_KEY, center_lat, center_lng, radius_m=1500, type_="restaurant"
@@ -720,10 +714,8 @@ if candidate_places and selected_place_id and run_btn:
         by=["rating", "reviews"], ascending=[False, False]
     )
 
-    # 3.3 GBP 评分
     gbp_result = score_gbp_profile(place_detail)
 
-    # 3.4 网站评分 & HTML
     website_url = website_override.strip() or place_detail.get("website", "")
     website_html = None
     if website_url:
@@ -732,7 +724,6 @@ if candidate_places and selected_place_id and run_btn:
 
     web_result = score_website_basic(website_url, website_html)
 
-    # 3.5 关键词排名 & 损失估算
     st.markdown("## 3️⃣ 关键词排名 & 潜在营收损失（粗略估算）")
 
     kw_list = [k.strip() for k in keywords_input.split(",") if k.strip()]
@@ -790,7 +781,6 @@ if candidate_places and selected_place_id and run_btn:
     rank_df = pd.DataFrame(rank_rows)
     st.dataframe(rank_df, use_container_width=True)
 
-    # 3.6 GBP & 网站详细展示
     st.markdown("## 4️⃣ Google 商家资料健康状况（Profile）")
 
     st.write(f"**Profile 评分：{gbp_result['score']} / 40**")
@@ -818,7 +808,6 @@ if candidate_places and selected_place_id and run_btn:
     else:
         st.warning("未在 Google 资料中发现官网链接，网站评分会偏低。")
 
-    # 3.7 竞争对手列表
     st.markdown("## 6️⃣ 附近竞争对手概览")
 
     if not competitors_df.empty:
@@ -829,7 +818,6 @@ if candidate_places and selected_place_id and run_btn:
     else:
         st.info("未能找到足够的竞争对手数据。")
 
-    # 3.8 总体在线健康总结
     st.markdown("## 7️⃣ 总体在线健康总结")
 
     total_score = gbp_result["score"] + web_result["score"]
@@ -841,13 +829,8 @@ if candidate_places and selected_place_id and run_btn:
         "- 60 分以上：相对健康，可以开始玩精细化运营和活动。"
     )
 
-    # =========================
-    # 8️⃣ ChatGPT 多维菜系 & 菜单结构 & 运营分析
-    # =========================
-
     st.markdown("## 8️⃣ ChatGPT 多维菜系 & 菜单结构 & 运营分析")
 
-    # 菜单 URL 自动发现
     auto_menu_urls = discover_menu_urls(place_detail, website_html)
     auto_menu_urls_str = "\n".join(auto_menu_urls)
 
@@ -881,7 +864,6 @@ if candidate_places and selected_place_id and run_btn:
     else:
         st.info("当前没有可用的菜单链接，AI 分析将主要基于 Google 资料和官网内容。")
 
-    # 生成 AI 深度分析报告
     st.markdown("### 🔍 生成 ChatGPT 菜系 & 菜单 & 运营深度分析报告")
 
     ai_btn = st.button("✨ 生成 AI 深度分析报告")
@@ -903,10 +885,6 @@ if candidate_places and selected_place_id and run_btn:
                 st.markdown(ai_report)
             except Exception as e:
                 st.error(f"调用 ChatGPT 失败：{e}")
-
-    # =========================
-    # 9️⃣ 引导：WhatsApp 获取完整报告
-    # =========================
 
     st.markdown("## 9️⃣ 免费获取完整诊断报告 & 1 对 1 咨询")
 
