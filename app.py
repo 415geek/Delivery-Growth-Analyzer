@@ -902,7 +902,7 @@ if candidate_places and selected_place_id and run_btn:
              font-size:16px;
              margin-top:8px;
            ">
-           📲 免费获取完整诊断报告（WhatsApp）
+           📲 免费获取完整诊断报告
         </a>
         """,
         unsafe_allow_html=True,
