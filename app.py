@@ -398,7 +398,7 @@ def llm_deep_analysis(
 """
 
     completion = client.chat.completions.create(
-        model="gpt-4.1-mini",
+        model="gpt-5.1",
         messages=[
             {"role": "system", "content": system_msg},
             {"role": "user", "content": user_msg},
