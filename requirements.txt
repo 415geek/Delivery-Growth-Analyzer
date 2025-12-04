@@ -1,6 +1,6 @@
 streamlit
 pandas
-numpy
 requests
+googlemaps
 beautifulsoup4
-openai>=1.30.0
+lxml
