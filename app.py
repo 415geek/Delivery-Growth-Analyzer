@@ -1,4 +1,3 @@
-import os
 import json
 from typing import List, Dict, Any, Optional
 
@@ -52,6 +51,8 @@ if "candidate_places" not in st.session_state:
     st.session_state["candidate_places"] = []
 if "selected_index" not in st.session_state:
     st.session_state["selected_index"] = 0
+if "run_analysis" not in st.session_state:
+    st.session_state["run_analysis"] = False
 
 # =========================
 # 工具函数（带缓存）
@@ -419,9 +420,7 @@ address_input = st.text_input(
     help="可以是完整地址或街道 + 城市，系统会用 Google 自动匹配附近的餐厅。",
 )
 
-search_btn = st.button("🔍 根据地址查找附近餐厅")
-
-if search_btn:
+if st.button("🔍 根据地址查找附近餐厅"):
     if not address_input.strip():
         st.error("请先输入地址。")
     else:
@@ -440,6 +439,7 @@ if search_btn:
                     st.warning("附近 300 米内未找到餐厅，请尝试输入更精确的地址或放大范围。")
                 else:
                     st.session_state["candidate_places"] = nearby
+                    st.session_state["run_analysis"] = False
                     st.success(f"已找到 {len(nearby)} 家附近餐厅，请在下方选择你的餐厅。")
 
 # =========================
@@ -508,17 +508,16 @@ if candidate_places:
         "",
     )
 
-    run_btn = st.button("🚀 运行分析")
-
+    if st.button("🚀 运行分析"):
+        st.session_state["run_analysis"] = True
 else:
     st.info("先输入地址并点击“根据地址查找附近餐厅”。")
-    run_btn = False
 
 # =========================
 # 3 主分析逻辑
 # =========================
 
-if candidate_places and selected_place_id and run_btn:
+if candidate_places and selected_place_id and st.session_state["run_analysis"]:
     # 1. 详情
     with st.spinner("获取餐厅详情（Google Place Details）..."):
         place_detail = google_place_details(GOOGLE_API_KEY, selected_place_id)
