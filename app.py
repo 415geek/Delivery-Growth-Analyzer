@@ -992,6 +992,6 @@ if candidate_places and selected_place_id and st.session_state["run_analysis"]:
     st.markdown("## 8️⃣ 免费获取完整 Aurainsight 报告")
 
     st.markdown(
-        
+         
 <div style="margin-top:10px; margin-bottom:20px;">
   <a href="https
