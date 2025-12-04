@@ -14,11 +14,10 @@ from openai import OpenAI
 # 基本配置 & Secrets
 # =========================
 st.set_page_config(
-    page_title="Restaurant Competitor Analyzer",
+    page_title="Restaurant Competitor & Menu Analyzer",
     layout="wide",
 )
 
-# 从 Streamlit Secrets 读取 API 密钥
 GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY", "")
 SERPAPI_KEY = st.secrets.get("SERPAPI_KEY", "")
 YELP_API_KEY = st.secrets.get("YELP_API_KEY", "")
@@ -35,13 +34,15 @@ if OPENAI_API_KEY:
 # =========================
 # 页面标题
 # =========================
-st.title("🍜 Restaurant Competitor Analyzer")
+st.title("🍜 Restaurant Local SEO + Menu Analyzer")
+
 st.write(
     "面向餐厅老板的一键体检：\n"
     "- 只需输入地址，自动匹配你的餐厅\n"
     "- 自动找附近竞争对手\n"
     "- 估算堂食/外卖的潜在流失营收\n"
-    "- 使用 ChatGPT 做菜系分析运营建议"
+    "- 可选：贴上外卖 / 在线点餐链接，做菜单级别分析\n"
+    "- 使用 ChatGPT 输出细分菜系 & 菜单结构 & 运营建议"
 )
 
 # =========================
@@ -71,8 +72,7 @@ def google_geocode(api_key: str, address: str) -> List[Dict[str, Any]]:
 def google_place_details(api_key: str, place_id: str) -> Dict[str, Any]:
     """
     Google Place Details：
-    先尝试带 fields，如果 SDK/版本不支持就 fallback 到不带 fields 的调用，
-    避免 ValueError.
+    先尝试带 fields，如果 SDK/版本不支持就 fallback 到不带 fields 的调用。
     """
     gmaps = gm_client(api_key)
     fields = [
@@ -92,7 +92,6 @@ def google_place_details(api_key: str, place_id: str) -> Dict[str, Any]:
         result = gmaps.place(place_id=place_id, fields=fields)
         data = result.get("result", result)
     except Exception:
-        # 回退：不传 fields，拿全部字段
         result = gmaps.place(place_id=place_id)
         data = result.get("result", result)
     return data
@@ -111,7 +110,7 @@ def google_places_nearby(
 def fetch_html(url: str) -> Optional[str]:
     try:
         headers = {"User-Agent": "Mozilla/5.0 (Restaurant-Analyzer)"}
-        resp = requests.get(url, headers=headers, timeout=10)
+        resp = requests.get(url, headers=headers, timeout=15)
         if resp.status_code == 200:
             return resp.text
         return None
@@ -303,8 +302,117 @@ def infer_rank_from_serpapi(
     return None
 
 # =========================
-# ChatGPT 深度分析函数
+# 菜单抓取相关函数
 # =========================
+
+def clean_text_block(text: str) -> str:
+    """简单清洗文本，去掉多余空白。"""
+    lines = [ln.strip() for ln in text.splitlines()]
+    lines = [ln for ln in lines if ln]
+    return "\n".join(lines)
+
+def extract_menu_text_from_html(html: str) -> str:
+    """
+    通用版菜单抓取：
+    - 移除 script/style
+    - 优先寻找包含价格符号/常见菜品关键词的行
+    - 不追求 100% 结构化，只要给 LLM 足够的半结构化信息
+    """
+    soup = BeautifulSoup(html, "lxml")
+
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+
+    raw_text = soup.get_text("\n", strip=True)
+    raw_text = clean_text_block(raw_text)
+
+    lines = raw_text.split("\n")
+    menu_lines = []
+
+    price_tokens = ["$", "￥", "£", "€"]
+    food_keywords = [
+        "chicken", "beef", "pork", "tofu", "noodle", "rice", "dumpling",
+        "soup", "fried", "braised", "spicy", "bbq", "curry",
+        "饭", "面", "粉", "鸡", "牛", "猪", "汤", "炒", "煎", "焗", "咖喱",
+    ]
+
+    for ln in lines:
+        l = ln.lower()
+        if any(p in ln for p in price_tokens) or any(k in l for k in food_keywords):
+            menu_lines.append(ln)
+
+    # 如果抓不到明显菜单线，就退回较长文本的一部分
+    if len(menu_lines) < 10:
+        menu_lines = lines
+
+    menu_text = "\n".join(menu_lines)
+    # 限制长度，避免 prompt 爆炸
+    return menu_text[:6000]
+
+def build_menu_payload(menu_urls: List[str]) -> List[Dict[str, str]]:
+    """
+    根据用户输入的菜单 URL 列表，抓取文本并构造 LLM 使用的结构。
+    """
+    menus: List[Dict[str, str]] = []
+    for url in menu_urls:
+        url = url.strip()
+        if not url:
+            continue
+        html = fetch_html(url)
+        if not html:
+            menus.append(
+                {
+                    "source": urlparse(url).netloc or "unknown",
+                    "url": url,
+                    "status": "fetch_failed",
+                    "menu_text": "",
+                }
+            )
+            continue
+        menu_text = extract_menu_text_from_html(html)
+        menus.append(
+            {
+                "source": urlparse(url).netloc or "unknown",
+                "url": url,
+                "status": "ok",
+                "menu_text": menu_text,
+            }
+        )
+    return menus
+
+# =========================
+# ChatGPT 封装 & 深度分析
+# =========================
+
+def call_llm_safe(messages: list) -> str:
+    """
+    优先尝试 gpt-4.1-mini，403/模型无权限时自动退回 gpt-4o-mini。
+    """
+    if client is None:
+        return "未配置 OPENAI_API_KEY，无法调用 ChatGPT。"
+
+    primary_model = "gpt-4.1-mini"
+    fallback_model = "gpt-4o-mini"
+
+    try:
+        resp = client.chat.completions.create(
+            model=primary_model,
+            messages=messages,
+            temperature=0.4,
+        )
+        return resp.choices[0].message.content
+    except Exception as e:
+        st.warning(f"使用 {primary_model} 失败，自动切换到 {fallback_model}。错误：{e}")
+
+    try:
+        resp = client.chat.completions.create(
+            model=fallback_model,
+            messages=messages,
+            temperature=0.4,
+        )
+        return resp.choices[0].message.content
+    except Exception as e:
+        return f"调用 ChatGPT 失败：{e}"
 
 def llm_deep_analysis(
     place_detail: Dict[str, Any],
@@ -315,6 +423,7 @@ def llm_deep_analysis(
     monthly_search_volume: int,
     dine_in_aov: float,
     delivery_aov: float,
+    menus: List[Dict[str, str]],
 ) -> str:
     if client is None:
         return "未配置 OPENAI_API_KEY，无法调用 ChatGPT。"
@@ -323,6 +432,18 @@ def llm_deep_analysis(
     if competitors_df is not None and not competitors_df.empty:
         sub = competitors_df.head(5)
         comp_json = sub.to_dict(orient="records")
+
+    # 只把每个菜单文本截断一下，防止太长
+    menus_safe = []
+    for m in menus:
+        menus_safe.append(
+            {
+                "source": m.get("source", ""),
+                "url": m.get("url", ""),
+                "status": m.get("status", ""),
+                "menu_text": (m.get("menu_text") or "")[:4000],
+            }
+        )
 
     payload = {
         "restaurant": {
@@ -346,67 +467,87 @@ def llm_deep_analysis(
             "dine_in_aov": dine_in_aov,
             "delivery_aov": delivery_aov,
         },
+        "menus": menus_safe,
     }
 
     text_snippet = web_result.get("text_snippet", "")
 
     system_msg = (
-        "你是一名专门服务北美餐馆的本地营销和外卖运营顾问，曾任职于麦肯锡一个专门做餐饮分析的部门，"
-        "非常了解世界各地的菜系，尤其在中餐菜系的细分领域属于行业权威，如粤菜、茶餐厅、川菜、湘菜、东北菜、上海菜等，"
-        "熟悉 Google 本地搜索和 UberEats/DoorDash/Grubhub/Hungrypanda/Fantuan 等平台的运营逻辑。"
+        "你是一名专门服务北美餐馆的本地营销和外卖运营顾问，曾任职于麦肯锡餐饮项目组，"
+        "非常了解世界各地的菜系，尤其在中餐细分领域（粤菜、茶餐厅、川菜、湘菜、东北菜、上海菜等），"
+        "熟悉 Google 本地搜索和 UberEats / DoorDash / Grubhub / Hungrypanda / Fantuan 等平台的运营逻辑。"
         "请用简体中文回答，但在需要时可加少量英文术语。"
     )
 
     user_msg = f"""
-这是一个餐厅的在线数据，请你做**多维深度分析**并给出细分菜系判断与运营建议。
+以下是某家餐厅的线上数据和菜单数据，请你结合一起做**多维深度分析**，重点包括“菜系细分 + 菜单结构 + 本地竞争 + 线上运营建议”。
 
 【结构化数据 JSON】
 {json.dumps(payload, ensure_ascii=False, indent=2)}
 
-【网站文本片段（最多 3000 字符）】
+【官网文本片段（最多 3000 字符）】
 {text_snippet}
 
-请完成以下任务（分段输出，方便老板阅读）：
+请按下面结构输出（分成清晰小标题，方便餐厅老板直接照做）：
 
-1. **菜系细分判断**
-   - 判断该店最有可能属于哪一类：如正宗川菜馆、港式茶餐厅、上海本帮菜、东北菜馆、粤式烧腊等。
-   - 给出你的判断理由（参考店名、菜品关键词、地理位置、价格带等）。
+1️⃣ 菜系细分判断
+- 根据餐厅名称、地址、Google 类型、评价以及菜单内容，判断该店最接近哪一类细分菜系：
+  - 例如：正宗川菜馆、家常川菜 + 美式中餐混搭、港式茶餐厅、粤菜烧腊、东北菜、上海本帮菜、美式中餐外卖店等。
+- 写出你的判断依据（例如：菜品名字、口味关键词、价位区间、菜单结构等）。
 
-2. **本地竞争格局**
-   - 根据竞争对手列表，归类他们的大致菜系（如：Mr Szechuan = 川菜，Khao Tiew = 泰国菜 等）。
-   - 对比本店在：评分、评论量、价格带、记忆点（特色菜/招牌）上的优势与短板。
+2️⃣ 本地竞争格局（基于附近竞争对手）
+- 将附近主要竞争对手按大致菜系分组（川菜、川湘、韩式炸鸡、泰国菜、美式炸鸡、休闲中餐等）。
+- 简要对比本店在以下维度的优劣势：
+  - 评分 & 评论数
+  - 价格带（便宜 / 中等 / 偏贵）
+  - 记忆点（是否有强记忆的招牌菜或菜系标签）
 
-3. **Google 商家资料（GBP）优化建议**
-   - 根据 gbp_score 与检查项，给出最优先要补的 3–5 项（如：照片、营业时间、服务选项等）。
-   - 每项都写出：具体要做什么 + 这件事如何帮助提高曝光/点击/下单。
+3️⃣ Google 商家资料（GBP）优化优先级
+- 结合 gbp_score 和各检查项，列出**最优先要补的 3–5 项**，例如：
+  - 照片数量 & 质量（门脸图、菜品图、菜单图）
+  - 营业时间、服务选项（dine-in / takeout / delivery）
+  - 官网链接、预订/点餐按钮等
+- 每一项都写清楚：
+  - 具体要做什么
+  - 这件事会如何影响曝光、点击率或下单率
 
-4. **网站内容与转化建议**
-   - 结合 website_score、字数与文本片段，评价目前网站在：
-     - 是否讲清楚菜系与招牌菜
-     - 是否有足够内容支撑 SEO
-     - 是否有清晰的在线下单/订位 CTA
-   - 给出 3–5 条具体优化建议（增加什么板块、需要出现哪些关键词、是否要增加套餐/团体菜单等）。
+4️⃣ 官网内容与转化建议
+- 评价官网目前在以下方面的表现：
+  - 是否一眼看得出菜系和招牌菜
+  - 文案是否区分堂食 vs 外卖场景
+  - 是否有清晰的在线点餐 / 订位 CTA（call-to-action）
+- 给出 3–5 条非常具体、能直接照抄的优化建议（用 bullet points）。
 
-5. **堂食 & 外卖收入增长策略**
-   - 已知堂食客单价约 {dine_in_aov} 美元、外卖客单价约 {delivery_aov} 美元。
-   - 设计 3 套组合打法，每套说明：
-     - 主攻人群（家庭聚餐、办公室午餐、学生夜宵等）
-     - 在 Google/官网/第三方外卖平台上分别要做的动作
-     - 预期带来的变化（如：Google 点击提升、外卖复购提升等）。
+5️⃣ 菜单结构 & 价格带分析（基于菜单链接）
+- 综合所有菜单文本（menus.menu_text），从下面几个角度分析：
+  - 菜单结构是否清晰（分类是否合理：前菜 / 主食 / 汤品 / 饮品 / 甜品 / 套餐等）
+  - 品类是否失衡（例如：热菜过多但无冷盘；没有家庭套餐；无 high-margin 饮品等）
+  - 价格带是否合理（有无明显断层；是否缺乏入门款和高客单升级款）
+- 指出 3–7 个可以改进的点，例如：
+  - 哪些菜应该做成组合套餐 / Family Meal
+  - 哪些菜适合当加价升级选项（例如 +$2 换大份 / 加肉 / 加配菜）
+  - 哪些品类完全缺失但在该菜系/商圈是刚需（如川菜馆却没有冷菜/冒菜等）
 
-请用小标题 + 列表形式输出，语气务实、接地气，面向湾区/北美华人餐厅老板。
+6️⃣ 堂食 & 外卖收入增长打法（结合搜索量与客单价）
+- 已知大致假设：每个核心关键词月搜索量约 {monthly_search_volume}，堂食客单价约 {dine_in_aov} 美元，外卖客单价约 {delivery_aov} 美元。
+- 设计 2–3 套「简单但有效」的增长组合打法，每套包括：
+  - 目标客群（家庭、办公室白领、附近学生、周末聚餐等）
+  - 在 Google / 官网 / 各外卖平台上分别要做的动作（带操作细节）
+  - 对应的菜单动作（例如新增某种套餐、把某些菜上移到首屏、做 limited-time offer 等）
+  - 预期能提升的环节（曝光、点击、加购率、复购率等）
+
+要求：
+- 语气务实、接地气，让湾区 / 北美华人餐厅老板能看得懂、敢照做；
+- 结构清晰，用小标题 + 列表；
+- 不要给空洞的鸡汤，要给具体动作清单。
 """
 
-    completion = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": user_msg},
-        ],
-        temperature=0.4,
-    )
+    messages = [
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": user_msg},
+    ]
 
-    return completion.choices[0].message.content
+    return call_llm_safe(messages)
 
 # =========================
 # 主界面：1 地址 → 候选餐厅
@@ -443,7 +584,7 @@ if st.button("🔍 根据地址查找附近餐厅"):
                     st.success(f"已找到 {len(nearby)} 家附近餐厅，请在下方选择你的餐厅。")
 
 # =========================
-# 2 选择餐厅 + 业务参数
+# 2 选择餐厅 + 业务参数 + 菜单链接
 # =========================
 
 candidate_places = st.session_state["candidate_places"]
@@ -506,6 +647,14 @@ if candidate_places:
     website_override = st.text_input(
         "如果你的官网和 Google 里记录的不一样，在这里填你的官网 URL（可选）",
         "",
+    )
+
+    st.markdown("### 菜单链接（可选，但强烈推荐）")
+    menu_urls_input = st.text_area(
+        "第三方外卖 / 在线点餐链接（如 DoorDash / UberEats / 官网点餐页等，每行一个 URL）",
+        "",
+        height=120,
+        help="例如：https://www.doordash.com/store/xxx ...，每行一个链接，用于做菜单级别分析。",
     )
 
     if st.button("🚀 运行分析"):
@@ -729,28 +878,49 @@ if candidate_places and selected_place_id and st.session_state["run_analysis"]:
         "- **60 分以上**：相对健康，可以开始玩精细化运营和活动。\n"
     )
 
-    # 7. ChatGPT 深度分析
-    st.markdown("## 7️⃣ ChatGPT 多维菜系 & 运营分析")
+    # 7. ChatGPT 深度分析（含菜单）
+    st.markdown("## 7️⃣ ChatGPT 多维菜系 & 菜单结构 & 运营分析")
+
+    menus: List[Dict[str, str]] = []
+    if menu_urls_input.strip():
+        menu_urls = [u.strip() for u in menu_urls_input.splitlines() if u.strip()]
+        with st.spinner("抓取菜单页面并提取菜品文本..."):
+            menus = build_menu_payload(menu_urls)
+
+        # 给你一个简单预览，确认有抓到东西
+        if menus:
+            st.markdown("#### 菜单抓取预览（调试用）")
+            preview_rows = []
+            for m in menus:
+                preview_rows.append(
+                    {
+                        "来源": m.get("source", ""),
+                        "URL": m.get("url", ""),
+                        "状态": m.get("status", ""),
+                        "菜单文本预览": (m.get("menu_text") or "")[:120],
+                    }
+                )
+            st.dataframe(pd.DataFrame(preview_rows), use_container_width=True)
+    else:
+        st.info("未填写任何菜单链接，将只做线上曝光和网站层面的分析。")
 
     if not OPENAI_API_KEY:
         st.warning("未配置 OPENAI_API_KEY，如需 AI 深度分析请在 Secrets 中添加。")
     else:
         if st.button("🤖 生成 AI 深度分析报告"):
             with st.spinner("正在调用 ChatGPT 分析..."):
-                try:
-                    ai_report = llm_deep_analysis(
-                        place_detail=place_detail,
-                        gbp_result=gbp_result,
-                        web_result=web_result,
-                        competitors_df=competitors_df,
-                        rank_results=rank_results,
-                        monthly_search_volume=monthly_search_volume,
-                        dine_in_aov=dine_in_aov,
-                        delivery_aov=delivery_aov,
-                    )
-                    st.markdown(ai_report)
-                except Exception as e:
-                    st.error(f"调用 ChatGPT API 出错：{e}")
+                ai_report = llm_deep_analysis(
+                    place_detail=place_detail,
+                    gbp_result=gbp_result,
+                    web_result=web_result,
+                    competitors_df=competitors_df,
+                    rank_results=rank_results,
+                    monthly_search_volume=monthly_search_volume,
+                    dine_in_aov=dine_in_aov,
+                    delivery_aov=delivery_aov,
+                    menus=menus,
+                )
+                st.markdown(ai_report)
 
 # ========== 署名（LinkedIn） ==========
 LINKEDIN_URL = "https://www.linkedin.com/in/lingyu-maxwell-lai"
