@@ -15,7 +15,7 @@ from openai import OpenAI
 # 基本配置 & Secrets
 # =========================
 st.set_page_config(
-    page_title="Restaurant Local SEO & Competitor Analyzer",
+    page_title="Restaurant Competitor Analyzer",
     layout="wide",
 )
 
@@ -350,10 +350,10 @@ def llm_deep_analysis(
     text_snippet = web_result.get("text_snippet", "")
 
     system_msg = (
-         "你是一名专门服务北美餐馆的本地营销和外卖运营顾问，曾任职于麦肯锡一个专门做餐饮分析的部门"
-         "非常了解世界各地的菜系，尤其在中餐菜系的细分领域属于行业权威，如粤菜、茶餐厅、川菜、湘菜、东北菜、上海菜等细分菜系，"
-         "熟悉 Google 本地搜索和 UberEats/DoorDash/Grubhub/Hungrypanda/Fantuan 等平台的运营逻辑。"
-         "请用简体中文回答，但在需要时可加少量英文术语。"
+        "你是一名专门服务北美餐馆的本地营销和外卖运营顾问，曾任职于麦肯锡一个专门做餐饮分析的部门，"
+        "非常了解世界各地的菜系，尤其在中餐菜系的细分领域属于行业权威，如粤菜、茶餐厅、川菜、湘菜、东北菜、上海菜等，"
+        "熟悉 Google 本地搜索和 UberEats/DoorDash/Grubhub/Hungrypanda/Fantuan 等平台的运营逻辑。"
+        "请用简体中文回答，但在需要时可加少量英文术语。"
     )
 
     user_msg = f"""
@@ -365,10 +365,35 @@ def llm_deep_analysis(
 【网站文本片段（最多 3000 字符）】
 {text_snippet}
 
-请你完成以下任务：
+请完成以下任务（分段输出，方便老板阅读）：
 
-1. 菜系细分判断……
-（后面同之前版本，略）
+1. **菜系细分判断**
+   - 判断该店最有可能属于哪一类：如正宗川菜馆、港式茶餐厅、上海本帮菜、东北菜馆、粤式烧腊等。
+   - 给出你的判断理由（参考店名、菜品关键词、地理位置、价格带等）。
+
+2. **本地竞争格局**
+   - 根据竞争对手列表，归类他们的大致菜系（如：Mr Szechuan = 川菜，Khao Tiew = 泰国菜 等）。
+   - 对比本店在：评分、评论量、价格带、记忆点（特色菜/招牌）上的优势与短板。
+
+3. **Google 商家资料（GBP）优化建议**
+   - 根据 gbp_score 与检查项，给出最优先要补的 3–5 项（如：照片、营业时间、服务选项等）。
+   - 每项都写出：具体要做什么 + 这件事如何帮助提高曝光/点击/下单。
+
+4. **网站内容与转化建议**
+   - 结合 website_score、字数与文本片段，评价目前网站在：
+     - 是否讲清楚菜系与招牌菜
+     - 是否有足够内容支撑 SEO
+     - 是否有清晰的在线下单/订位 CTA
+   - 给出 3–5 条具体优化建议（增加什么板块、需要出现哪些关键词、是否要增加套餐/团体菜单等）。
+
+5. **堂食 & 外卖收入增长策略**
+   - 已知堂食客单价约 {dine_in_aov} 美元、外卖客单价约 {delivery_aov} 美元。
+   - 设计 3 套组合打法，每套说明：
+     - 主攻人群（家庭聚餐、办公室午餐、学生夜宵等）
+     - 在 Google/官网/第三方外卖平台上分别要做的动作
+     - 预期带来的变化（如：Google 点击提升、外卖复购提升等）。
+
+请用小标题 + 列表形式输出，语气务实、接地气，面向湾区/北美华人餐厅老板。
 """
 
     completion = client.chat.completions.create(
@@ -487,19 +512,247 @@ if candidate_places:
 
 else:
     st.info("先输入地址并点击“根据地址查找附近餐厅”。")
+    run_btn = False
 
 # =========================
 # 3 主分析逻辑
 # =========================
 
-if candidate_places and selected_place_id and "run_btn" in locals() and run_btn:
+if candidate_places and selected_place_id and run_btn:
+    # 1. 详情
     with st.spinner("获取餐厅详情（Google Place Details）..."):
         place_detail = google_place_details(GOOGLE_API_KEY, selected_place_id)
 
     st.success(f"已锁定餐厅：**{place_detail.get('name', 'Unknown')}**")
 
-    # 下面逻辑与之前一致：竞争对手、GBP 评分、网站评分、关键词排名、AI 分析……
-    #（为了不超字数，就不再全部重复展开，如果你需要我也可以再给你一份完整展开版）
+    st.markdown("### 🧾 基本信息（来自 Google Places）")
+    info_cols = st.columns(3)
+    with info_cols[0]:
+        st.write("**名称**:", place_detail.get("name"))
+        st.write("**地址**:", place_detail.get("formatted_address"))
+    with info_cols[1]:
+        st.write("**电话**:", place_detail.get("formatted_phone_number", "N/A"))
+        st.write("**评分**:", place_detail.get("rating", "N/A"))
+        st.write("**评论数**:", place_detail.get("user_ratings_total", "N/A"))
+    with info_cols[2]:
+        st.write("**价格等级**:", place_detail.get("price_level", "N/A"))
+        st.write("**官网（Google）**:", place_detail.get("website", "N/A"))
+
+    geometry = place_detail.get("geometry", {}).get("location", {})
+    lat = geometry.get("lat")
+    lng = geometry.get("lng")
+
+    # 2. 附近竞争对手
+    st.markdown("## 2️⃣ 附近竞争对手（3 公里范围）")
+    competitors_df = None
+    competitors = []
+
+    if lat is None or lng is None:
+        st.warning("未能从 Google 获取经纬度，无法搜索附近竞争对手。")
+    else:
+        with st.spinner("搜索附近餐厅作为竞争对手..."):
+            competitors = google_places_nearby(
+                GOOGLE_API_KEY, lat, lng, radius_m=3000, type_="restaurant"
+            )
+
+        if competitors:
+            comp_data = []
+            for c in competitors:
+                comp_data.append(
+                    {
+                        "Name": c.get("name"),
+                        "Address": c.get("vicinity"),
+                        "Rating": c.get("rating", None),
+                        "Reviews": c.get("user_ratings_total", 0),
+                    }
+                )
+            competitors_df = pd.DataFrame(comp_data)
+            competitors_df = competitors_df[
+                competitors_df["Name"].str.lower()
+                != place_detail.get("name", "").lower()
+            ]
+            competitors_df = competitors_df.sort_values(
+                by=["Rating", "Reviews"], ascending=[False, False]
+            ).reset_index(drop=True)
+            st.dataframe(competitors_df, use_container_width=True)
+        else:
+            st.info("未找到竞争对手（可能 API 限制或附近餐厅很少）。")
+
+    # 3. GBP 评分
+    st.markdown("## 3️⃣ Google 商家资料评分（40 分制）")
+    gbp_result = score_gbp_profile(place_detail)
+    st.metric("Google 商家资料得分", f"{gbp_result['score']} / 40")
+
+    gbp_rows = []
+    for label, (pts, ok) in gbp_result["checks"].items():
+        gbp_rows.append(
+            {"检查项": label, "得分": pts, "状态": "✅ 完成" if ok else "❌ 缺失/不完整"}
+        )
+    st.table(pd.DataFrame(gbp_rows))
+
+    # 4. 网站评分
+    st.markdown("## 4️⃣ 网站内容 & 体验评分（40 分制）")
+    effective_website = website_override or place_detail.get("website")
+
+    if not effective_website:
+        st.warning("未提供网站 URL，也无法从 Google 获取，网站评分为 0。")
+        web_result = {
+            "score": 0,
+            "checks": {"无网站": (0, False)},
+            "word_count": 0,
+            "title": "",
+            "text_snippet": "",
+        }
+    else:
+        with st.spinner(f"抓取网站：{effective_website}"):
+            html = fetch_html(effective_website)
+        web_result = score_website_basic(effective_website, html)
+
+    st.metric("网站得分", f"{web_result['score']} / 40")
+    web_rows = []
+    for label, (pts, ok) in web_result["checks"].items():
+        web_rows.append(
+            {"检查项": label, "得分": pts, "状态": "✅ 是" if ok else "❌ 否"}
+        )
+    st.table(pd.DataFrame(web_rows))
+
+    # 5. 关键词排名 & 堂食/外卖营收损失
+    st.markdown("## 5️⃣ 关键词排名 & 堂食 / 外卖潜在营收损失")
+
+    keywords = [k.strip() for k in keywords_input.split(",") if k.strip()]
+    rank_results: List[Dict[str, Any]] = []
+
+    if not keywords:
+        st.info("未提供关键词，跳过排名模拟和营收估算。")
+    else:
+        for kw in keywords:
+            st.write(f"### 关键词：**{kw}**")
+            rank_bucket = "none"
+            rank_position = None
+
+            if SERPAPI_KEY and lat is not None and lng is not None:
+                with st.spinner(f"使用 SerpAPI 查询 Google Maps 排名：{kw}"):
+                    try:
+                        serp_json = serpapi_google_maps_search(
+                            SERPAPI_KEY, kw, lat, lng
+                        )
+                        rank_position = infer_rank_from_serpapi(
+                            serp_json, place_detail.get("name", "")
+                        )
+                        if rank_position is not None:
+                            if rank_position <= 3:
+                                rank_bucket = "top3"
+                            elif rank_position <= 10:
+                                rank_bucket = "4-10"
+                            else:
+                                rank_bucket = "none"
+                    except Exception as e:
+                        st.warning(f"SerpAPI 查询出错：{e}")
+                        rank_bucket = "none"
+                        rank_position = None
+            else:
+                # 没有 SerpAPI：用评分+评论简单近似排序
+                if competitors:
+                    all_places = competitors + [place_detail]
+                    all_places_data = []
+                    for p in all_places:
+                        all_places_data.append(
+                            {
+                                "name": p.get("name", ""),
+                                "rating": p.get("rating", 0),
+                                "reviews": p.get("user_ratings_total", 0),
+                            }
+                        )
+                    df_all = pd.DataFrame(all_places_data)
+                    df_all["score"] = (
+                        df_all["rating"].fillna(0) * 10
+                        + df_all["reviews"].fillna(0) / 10
+                    )
+                    df_all = df_all.sort_values(
+                        by="score", ascending=False
+                    ).reset_index(drop=True)
+                    positions = df_all["name"].str.lower().tolist()
+                    name_lower = place_detail.get("name", "").lower()
+                    if name_lower in positions:
+                        pos = positions.index(name_lower) + 1
+                        rank_position = pos
+                        if pos <= 3:
+                            rank_bucket = "top3"
+                        elif pos <= 10:
+                            rank_bucket = "4-10"
+                        else:
+                            rank_bucket = "none"
+
+            monthly_loss_dine_in = estimate_revenue_loss(
+                monthly_search_volume,
+                rank_bucket,
+                dine_in_aov,
+                channel="dine-in",
+            )
+            monthly_loss_delivery = estimate_revenue_loss(
+                monthly_search_volume,
+                rank_bucket,
+                delivery_aov,
+                channel="delivery",
+            )
+
+            st.write(
+                f"- 估计当前排名："
+                f"{'Top 3' if rank_bucket=='top3' else ('第 4–10 名' if rank_bucket=='4-10' else '未进入前 10')}"
+                f"{'' if rank_position is None else f'（推测名次：{rank_position}）'}"
+            )
+            st.write(
+                f"- 堂食：每月可能少赚约 **${monthly_loss_dine_in:,.0f}**；"
+                f"外卖：每月可能少赚约 **${monthly_loss_delivery:,.0f}**。"
+            )
+
+            rank_results.append(
+                {
+                    "关键词": kw,
+                    "预估名次": rank_position,
+                    "名次区间": rank_bucket,
+                    "堂食月损失($)": round(monthly_loss_dine_in, 2),
+                    "外卖月损失($)": round(monthly_loss_delivery, 2),
+                }
+            )
+
+        if rank_results:
+            st.markdown("#### 关键词 & 堂食/外卖营收损失汇总")
+            st.dataframe(pd.DataFrame(rank_results), use_container_width=True)
+
+    # 6. 综合得分
+    st.markdown("## 6️⃣ 总体在线健康总结")
+    total_score = gbp_result["score"] + web_result["score"]
+    st.metric("综合得分（Profile + Website）", f"{total_score} / 80")
+    st.write(
+        "- **40 分以下**：在线基础非常弱，基本属于 “Poor”。\n"
+        "- **40–60 分**：中等，能被找得到，但不占优势。\n"
+        "- **60 分以上**：相对健康，可以开始玩精细化运营和活动。\n"
+    )
+
+    # 7. ChatGPT 深度分析
+    st.markdown("## 7️⃣ ChatGPT 多维菜系 & 运营分析")
+
+    if not OPENAI_API_KEY:
+        st.warning("未配置 OPENAI_API_KEY，如需 AI 深度分析请在 Secrets 中添加。")
+    else:
+        if st.button("🤖 生成 AI 深度分析报告"):
+            with st.spinner("正在调用 ChatGPT 分析..."):
+                try:
+                    ai_report = llm_deep_analysis(
+                        place_detail=place_detail,
+                        gbp_result=gbp_result,
+                        web_result=web_result,
+                        competitors_df=competitors_df,
+                        rank_results=rank_results,
+                        monthly_search_volume=monthly_search_volume,
+                        dine_in_aov=dine_in_aov,
+                        delivery_aov=delivery_aov,
+                    )
+                    st.markdown(ai_report)
+                except Exception as e:
+                    st.error(f"调用 ChatGPT API 出错：{e}")
+
 # ========== 署名（LinkedIn） ==========
 LINKEDIN_URL = "https://www.linkedin.com/in/lingyu-maxwell-lai"
 st.markdown(
