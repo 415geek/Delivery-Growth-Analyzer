@@ -5,3 +5,4 @@ googlemaps
 beautifulsoup4
 lxml
 openai
+requests-html
