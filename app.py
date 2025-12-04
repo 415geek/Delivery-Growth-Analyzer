@@ -29,19 +29,17 @@ st.write(
 # ---------------------------
 # 侧边栏：API Key & 参数
 # ---------------------------
-st.sidebar.header("🔑 API & Config")
+# ---------------------------
+# 从 secrets 读取 API Key
+# ---------------------------
+GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY", "")
+SERPAPI_KEY = st.secrets.get("SERPAPI_KEY", "")
+YELP_API_KEY = st.secrets.get("YELP_API_KEY", "")
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")  # 以后要用可以直接拿
 
-google_api_key = st.sidebar.text_input(
-    "Google API Key（Places / Maps）",
-    type="password",
-    help="需要启用 Places API / Maps API。",
-)
-
-serpapi_key = st.sidebar.text_input(
-    "SerpAPI Key（可选，用于真实 Google Maps 排名）",
-    type="password",
-    help="如果没有，可以先留空，使用简化版排名模拟。",
-)
+if not GOOGLE_API_KEY:
+    st.error("缺少 GOOGLE_API_KEY，请在 Streamlit Secrets 中配置。")
+    st.stop()
 
 default_radius_km = st.sidebar.slider(
     "竞争对手搜索半径（公里）", 0.5, 10.0, 3.0, 0.5
@@ -60,7 +58,7 @@ assumed_conv = st.sidebar.slider(
 )
 
 st.sidebar.markdown("---")
-st.sidebar.caption("所有 Key 只在本地会话使用，不会被保存。")
+
 
 
 # ---------------------------
