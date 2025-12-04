@@ -151,14 +151,11 @@ def fetch_html(url: str) -> Optional[str]:
         resp = requests.get(url, headers=headers, timeout=15)
         if resp.status_code < 400 and "text/html" in resp.headers.get("Content-Type", ""):
             return resp.text
-        st.warning(f"[菜单抓取] 普通请求效果一般，状态码 {resp.status_code}。")
-    except Exception as e:
-        st.warning(f"[菜单抓取] 普通请求出错：{e}")
+    except Exception:
+        pass
 
     # 第二次（可选）尝试：headless 浏览器执行 JS
     if not HAS_REQUESTS_HTML:
-        # 当前环境不支持 headless，就直接结束
-        st.info("当前运行环境不支持 headless 浏览器渲染，已退回普通抓取模式。")
         return None
 
     try:
@@ -166,8 +163,7 @@ def fetch_html(url: str) -> Optional[str]:
         r = session.get(url, headers=headers, timeout=30)
         r.html.render(timeout=40, sleep=2)
         return r.html.html
-    except Exception as e:
-        st.warning(f"[菜单抓取] headless 渲染失败：{e}")
+    except Exception:
         return None
 
 # =========================
@@ -456,7 +452,7 @@ def discover_menu_urls(place_detail: Dict[str, Any], website_html: Optional[str]
 
 def call_llm_safe(messages: List[Dict[str, str]]) -> str:
     if client is None:
-        return "未配置 OPENAI_API_KEY，无法调用 ChatGPT。"
+        return "未配置 OPENAI_API_KEY，无法调用 ChatGPT，请在 Streamlit Secrets 中添加 OPENAI_API_KEY。"
     try:
         completion = client.chat.completions.create(
             model="gpt-4.1-mini",
@@ -464,13 +460,17 @@ def call_llm_safe(messages: List[Dict[str, str]]) -> str:
             temperature=0.4,
         )
         return completion.choices[0].message.content
-    except Exception:
-        completion = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
-            temperature=0.4,
-        )
-        return completion.choices[0].message.content
+    except Exception as e:
+        # fallback + 带上错误信息
+        try:
+            completion = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages,
+                temperature=0.4,
+            )
+            return completion.choices[0].message.content
+        except Exception as e2:
+            return f"调用 ChatGPT 失败。\n主模型错误：{e}\n备用模型错误：{e2}"
 
 
 def llm_deep_analysis(
@@ -613,6 +613,8 @@ candidate_places = st.session_state["candidate_places"]
 selected_place_id: Optional[str] = None
 place_label_list: List[str] = []
 
+run_btn = False  # 先默认 False，避免未定义
+
 if candidate_places:
     st.markdown("## 2️⃣ 选择你的餐厅 & 填写关键业务参数")
 
@@ -670,10 +672,8 @@ if candidate_places:
     )
 
     run_btn = st.button("🚀 运行分析")
-
 else:
     st.info("先输入地址并点击“根据地址查找附近餐厅”。")
-    run_btn = False
 
 # =========================
 # 3️⃣ 主分析逻辑
@@ -829,7 +829,7 @@ if candidate_places and selected_place_id and run_btn:
         "- 60 分以上：相对健康，可以开始玩精细化运营和活动。"
     )
 
-    st.markdown("## 8️⃣ ChatGPT 多维菜系 & 菜单结构 & 运营分析")
+    st.markdown("## 8️⃣ ChatGPT 菜系 & 菜单 & 运营深度分析")
 
     auto_menu_urls = discover_menu_urls(place_detail, website_html)
     auto_menu_urls_str = "\n".join(auto_menu_urls)
@@ -869,22 +869,31 @@ if candidate_places and selected_place_id and run_btn:
     ai_btn = st.button("✨ 生成 AI 深度分析报告")
 
     if ai_btn:
-        with st.spinner("正在调用 ChatGPT 生成分析报告，大概需要几秒钟..."):
-            try:
-                ai_report = llm_deep_analysis(
-                    place_detail=place_detail,
-                    gbp_result=gbp_result,
-                    web_result=web_result,
-                    competitors_df=competitors_df,
-                    rank_results=rank_rows,
-                    monthly_search_volume=monthly_search_volume,
-                    dine_in_aov=dine_in_aov,
-                    delivery_aov=delivery_aov,
-                    menus_payload=menus_payload,
-                )
-                st.markdown(ai_report)
-            except Exception as e:
-                st.error(f"调用 ChatGPT 失败：{e}")
+        # 调试提示：至少证明按钮真的被触发了
+        st.info("已收到生成请求，正在调用 ChatGPT ...")
+
+        if client is None:
+            st.error("当前未配置 OPENAI_API_KEY，无法调用 ChatGPT，请在 Streamlit Secrets 中添加 OPENAI_API_KEY。")
+        else:
+            import traceback
+
+            with st.spinner("正在调用 ChatGPT 生成分析报告，大概需要几秒钟..."):
+                try:
+                    ai_report = llm_deep_analysis(
+                        place_detail=place_detail,
+                        gbp_result=gbp_result,
+                        web_result=web_result,
+                        competitors_df=competitors_df,
+                        rank_results=rank_rows,
+                        monthly_search_volume=monthly_search_volume,
+                        dine_in_aov=dine_in_aov,
+                        delivery_aov=delivery_aov,
+                        menus_payload=menus_payload,
+                    )
+                    st.markdown(ai_report)
+                except Exception as e:
+                    st.error(f"调用 ChatGPT 时发生未捕获错误：{e}")
+                    st.code(traceback.format_exc())
 
     st.markdown("## 9️⃣ 免费获取完整诊断报告 & 1 对 1 咨询")
 
@@ -902,7 +911,7 @@ if candidate_places and selected_place_id and run_btn:
              font-size:16px;
              margin-top:8px;
            ">
-           📲 免费获取完整诊断报告
+           📲 免费获取完整诊断报告（WhatsApp）
         </a>
         """,
         unsafe_allow_html=True,
