@@ -34,7 +34,7 @@ st.write(
     "- 只需输入地址，自动匹配你的餐厅\n"
     "- 自动扫描附近竞争对手\n"
     "- 估算堂食 / 外卖的潜在流失营收\n"
-    "- 抓取官网 / 外卖平台 / Google 菜单图片，结合 ChatGPT 做多维菜系 & 菜单结构 & 运营分析\n"
+    "- 抓取官网 / 外卖平台 / Google 菜单图片，结合 AI 做多维菜系 & 菜单结构 & 运营分析\n"
     "- 基于菜单菜系画像，自动筛选真正的核心竞对（实验功能）"
 )
 
@@ -219,8 +219,10 @@ def get_place_photos(place_detail: Dict[str, Any], max_photos: int = 12) -> List
 
 def ocr_menu_from_image_bytes(img_bytes: bytes) -> str:
     """
-    使用 OpenAI 多模态从菜单图片里提取【菜名 + 价格】文本。
-    返回的就是可以直接拼进 menu_text 的多行字符串。
+    使用 OpenAI 多模态从图片中提取菜单信息：
+    - 如果有菜单文字：输出菜名 + 价格
+    - 如果无文字但有菜品照片：猜菜名，价格 unknown
+    - 如果只是门头/环境/Logo：返回空字符串（忽略）
     """
     if client is None:
         return ""
@@ -228,20 +230,45 @@ def ocr_menu_from_image_bytes(img_bytes: bytes) -> str:
     b64 = base64.b64encode(img_bytes).decode("utf-8")
     data_url = f"data:image/jpeg;base64,{b64}"
 
-    prompt = (
-        "这是一张餐厅菜单的照片。请帮我识别出**菜品名称和价格**，"
-        "按每行一个菜输出，格式：`原文菜名 - 英文名(如果有) - 价格`。"
-        "如果没有英文名就留空；如果有多种规格，可以拆成多行。不要输出解释文字，只输出菜单条目。"
-    )
+    prompt = """
+你现在要判断这张图片是不是“有用的菜单相关图片”。
 
+请按以下逻辑处理：
+
+1. 如果图片上有明显的菜单文字（例如菜名、描述、价格、类似菜单排版）：
+   - 只提取菜品名称和价格。
+   - 每行输出一个菜，格式：
+     菜名原文 - 英文名(如果有就写，没有就留空) - 价格
+   - 如果是多种规格，可以拆成多行。
+   - 不要输出任何额外说明。
+
+2. 如果图片上没有明显的文字，但能清楚看到一盘菜或一杯饮料等“单品菜品照片”：
+   - 猜测该菜/饮品最可能的中英文名称。
+   - 每行输出一个候选，格式：
+     猜测菜名(中文，如果你知道) - English name(如果能判断) - unknown
+   - 最多输出 1-3 行。
+   - 不要输出其他解释。
+
+3. 如果图片主要是店招、Logo、人像、街景、室内环境，没有可识别的菜单文字，也看不清具体菜品：
+   - 不要输出任何内容，返回完全空的结果。
+
+总规则：
+- 只输出菜单条目文本，不要加标题、说明、前后缀。
+- 如果最后判断属于第 3 种情况，就返回空字符串。
+"""
+
+    # 注意：这里用的是新版多模态 content 结构
     resp = client.chat.completions.create(
         model="gpt-4.1-mini",
         messages=[
             {
                 "role": "user",
                 "content": [
-                    {"type": "input_text", "text": prompt},
-                    {"type": "input_image", "image_url": data_url},
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": data_url},
+                    },
                 ],
             }
         ],
@@ -623,7 +650,7 @@ def rank_competitors_with_gpt(
     candidates: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     """
-    让 ChatGPT 在候选餐厅中挑出真正的 5–10 家核心竞对，并按相似度排序。
+    让 系统 在候选餐厅中挑出真正的 5–10 家核心竞对，并按相似度排序。
     """
     if client is None:
         return []
@@ -634,7 +661,7 @@ def rank_competitors_with_gpt(
 请你从候选中选出最像的 5-10 家竞对，并按相似度从高到低排序。
 
 相似度判断维度包括：
-- 菜系 / 类别是否接近（比如都是川菜、粤菜、港式茶餐厅等）
+- 菜系或菜品 / 类别是否接近（比如都是川菜、粤菜、港式茶餐厅等）
 - 价格带是否接近
 - 是否属于相似业态（正餐/快餐/茶餐厅/奶茶店/烘焙店）
 - 若信息有限，可根据分类 types 和餐厅名称做合理推断
@@ -763,7 +790,7 @@ def llm_deep_analysis(
 请你完成以下任务（分段输出）：
 
 1. **菜系细分判断**
-   - 判断该店的主菜系和子菜系（例如：粤菜-茶餐厅、川菜-辣炒、东北家常菜、上海本帮菜等），说明依据。
+   - 判断该店的主菜系和子菜系（例如：粤菜-茶餐厅、川菜-辣炒、东北家常菜、上海菜等），说明依据。
    - 如果菜单里有多种菜系，请说明主次结构。
 
 2. **菜单结构与价格带分析**
@@ -880,7 +907,7 @@ if candidate_places:
     st.markdown("### 关键词 & 搜索量（不懂就用默认值）")
 
     keywords_input = st.text_input(
-        "核心关键词（逗号分隔）",
+        "特色菜品或品牌核心关键词（逗号分隔）",
         "best chinese food, best asian food, best baked chicken",
         help="用于估算你在 Google 本地搜索里的机会。不懂就用默认值。",
     )
@@ -1100,7 +1127,7 @@ if candidate_places and selected_place_id and (
                         st.markdown(f"**OCR 菜单 #{idx}：**")
                         st.code(txt, language="text")
                 else:
-                    st.warning("没有从勾选的图片中识别出有效菜单文本。")
+                    st.warning("没有从勾选的图片中识别出有效菜单或菜品。")
     else:
         st.info("当前餐厅的 Google Place 资料中没有图片，或不足以用于菜单识别。")
 
@@ -1108,7 +1135,7 @@ if candidate_places and selected_place_id and (
     # 9️⃣ 菜单抓取（官网/外卖链接）+ 合并 OCR 菜单
     # =============================
 
-    st.markdown("## 9️⃣ 菜单抓取 & ChatGPT 菜系 / 菜单结构分析")
+    st.markdown("## 9️⃣ 菜单抓取 & AI 菜系 / 菜单结构分析")
 
     auto_menu_urls = discover_menu_urls(place_detail, website_html)
     auto_menu_urls_str = "\n".join(auto_menu_urls)
