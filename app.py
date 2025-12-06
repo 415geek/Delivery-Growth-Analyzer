@@ -33,7 +33,8 @@ st.write(
     "- 只需输入地址，自动匹配你的餐厅\n"
     "- 自动扫描附近竞争对手\n"
     "- 估算堂食 / 外卖的潜在流失营收\n"
-    "- 抓取官网 / 第三方平台菜单，结合 ChatGPT 做多维菜系 & 菜单结构 & 运营分析"
+    "- 抓取官网 / 第三方平台菜单，结合 ChatGPT 做多维菜系 & 菜单结构 & 运营分析\n"
+    "- 基于菜单菜系画像，自动筛选真正的核心竞对（实验功能）"
 )
 
 # 从 Streamlit Secrets 读取 API 密钥
@@ -339,7 +340,7 @@ def infer_rank_from_serpapi(
     return None
 
 # =========================
-# 菜单相关
+# 菜单相关 & 菜系画像
 # =========================
 
 def extract_menu_text_from_html(html: str) -> str:
@@ -449,6 +450,149 @@ def discover_menu_urls(place_detail: Dict[str, Any], website_html: Optional[str]
                     urls.add(href)
 
     return list(urls)
+
+# ========== 菜单菜系画像 & 精准竞对辅助函数 ==========
+
+def analyze_menu_profile(menu_text: str) -> Dict[str, Any]:
+    """
+    用 ChatGPT 根据菜单文本做菜系画像（川菜 / 粤菜 / 港式茶餐厅 / 点心 / 奶茶店等）
+    """
+    if client is None:
+        return {"error": "未配置 OPENAI_API_KEY，无法进行菜系画像分析。"}
+
+    system_prompt = """
+你是一名熟悉北美中餐市场的餐饮顾问，专门根据菜单内容给餐厅做画像。
+
+特别规则（很重要）：
+- 如果菜单里出现大量“焗饭、焗猪扒饭、意粉（意大利面）、公仔面、菠萝油、多士、三文治”等，
+  并且同时有港式奶茶、鸳鸯等饮品，这家店很大概率是【港式茶餐厅】。
+- 如果菜单里出现大量“蒸排骨、凤爪、萝卜糕、虾饺、烧卖、肠粉、叉烧包、流沙包”等点心类菜品，
+  并以一笼一笼的小份为主，这家店很大概率是【粤式早茶/点心为主的粤菜馆】。
+- 如果两者都有，要看哪一类菜品占比更高：
+  - 茶餐厅：主食类焗饭/意粉/公仔面/套餐多，点心只是少量补充。
+  - 粤菜酒楼/点心店：点心类品种非常多，焗饭/意粉只是少量出现。
+
+- 川菜特征关键词举例：水煮鱼、麻婆豆腐、毛血旺、酸菜鱼、辣子鸡、干锅、冒菜、串串香等。
+- 湘菜特征关键词举例：剁椒鱼头、农家小炒肉、手撕包菜、臭豆腐、口味虾等。
+- 北方面馆/饺子馆可以包含：饺子、锅贴、手工面、牛肉面、羊肉串、锅包肉等。
+
+输出必须是 JSON，字段如下：
+- primary_cuisine: 主菜系，比如 "川菜", "粤菜", "港式茶餐厅", "粤式点心", "面包店", "奶茶店", "其他中餐"
+- secondary_cuisines: 可能的次要菜系列表，比如 ["粤菜", "港式茶餐厅"]
+- business_type: "正餐" / "快餐" / "手摇饮" / "烘焙甜品"
+- price_level: 从 1 到 4, 对应人均大概 $: 1=便宜, 2=中等, 3=偏高, 4=高端
+- signature_items: 菜单中你认为最能代表这家店风格的 3-5 个菜品名（用原文）
+- competitor_search_keywords: 搜索竞对时建议用的英文关键词列表
+- notes: 你的判断依据和提醒（中文）
+只输出 JSON。
+    """.strip()
+
+    user_prompt = f"以下是这家餐厅的菜单内容（菜名+简介，可以不完整）：\n\n{menu_text}\n\n请根据上面的要求输出 JSON。"
+
+    resp = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.2,
+    )
+    return json.loads(resp.choices[0].message.content)
+
+
+def build_competitor_profiles(
+    competitors_df: pd.DataFrame,
+    api_key: str,
+    max_n: int = 15,
+) -> List[Dict[str, Any]]:
+    """
+    将附近竞争对手的基础信息 + Google 详情整理成给 AI 用的简洁结构。
+    为控制调用次数，只取评分靠前的前 max_n 家。
+    """
+    profiles: List[Dict[str, Any]] = []
+    if competitors_df is None or competitors_df.empty:
+        return profiles
+
+    subset = competitors_df.head(max_n)
+    for _, row in subset.iterrows():
+        pid = row.get("place_id")
+        if not pid:
+            continue
+        try:
+            detail = google_place_details(api_key, pid)
+        except Exception:
+            detail = {}
+
+        profiles.append(
+            {
+                "name": detail.get("name") or row.get("name"),
+                "vicinity": detail.get("formatted_address") or row.get("vicinity"),
+                "rating": detail.get("rating") or row.get("rating"),
+                "reviews": detail.get("user_ratings_total") or row.get("reviews"),
+                "price_level": detail.get("price_level"),
+                "types": detail.get("types", []),
+            }
+        )
+    return profiles
+
+
+def rank_competitors_with_gpt(
+    profile: Dict[str, Any],
+    candidates: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    让 ChatGPT 在候选餐厅中挑出真正的 5–10 家核心竞对，并按相似度排序。
+    """
+    if client is None:
+        return []
+
+    system_prompt = """
+你是一名熟悉北美中餐市场的竞对分析师。
+现在有一间目标餐厅的菜系画像，以及一批附近候选餐厅的信息。
+请你从候选中选出最像的 5-10 家竞对，并按相似度从高到低排序。
+
+相似度判断维度包括：
+- 菜系 / 类别是否接近（比如都是川菜、粤菜、港式茶餐厅等）
+- 价格带是否接近
+- 是否属于相似业态（正餐/快餐/茶餐厅/奶茶店/烘焙店）
+- 若信息有限，可根据分类 types 和餐厅名称做合理推断
+
+输出 JSON 对象：
+{
+  "competitors": [
+    {
+      "name": "...",
+      "similarity_score": 0-100,
+      "main_reason": "1-2 句中文解释",
+      "vicinity": "...",
+      "rating": 4.5,
+      "reviews": 123,
+      "price_level": 2,
+      "types": ["chinese", "restaurant"]
+    },
+    ...
+  ]
+}
+    """.strip()
+
+    user_content = {
+        "target_profile": profile,
+        "candidates": candidates,
+    }
+
+    resp = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(user_content, ensure_ascii=False)},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.3,
+    )
+
+    data = json.loads(resp.choices[0].message.content)
+    return data.get("competitors", [])
 
 # =========================
 # ChatGPT 深度分析函数
@@ -840,7 +984,7 @@ if candidate_places and selected_place_id and (
         "- 60 分以上：相对健康，可以开始玩精细化运营和活动。"
     )
 
-    st.markdown("## 8️⃣ ChatGPT 菜系 & 菜单结构 & 运营深度分析")
+    st.markdown("## 8️⃣ 菜单抓取 & ChatGPT 菜系 / 菜单结构分析")
 
     auto_menu_urls = discover_menu_urls(place_detail, website_html)
     auto_menu_urls_str = "\n".join(auto_menu_urls)
@@ -875,9 +1019,53 @@ if candidate_places and selected_place_id and (
     else:
         st.info("当前没有可用的菜单链接，AI 分析将主要基于 Google 资料和官网内容。")
 
+    # ========== 新增：基于菜单菜系画像的精准竞对模块 ==========
+    st.markdown("### 🍜 基于菜单菜系画像的精准竞对（实验功能）")
+
+    ai_comp_btn = st.button("✨ 生成菜系画像 + 精准竞对列表")
+
+    if ai_comp_btn:
+        if client is None:
+            st.error("未配置 OPENAI_API_KEY，无法进行菜系画像和竞对筛选。")
+        else:
+            # 汇总所有菜单文本
+            combined_menu_text = "\n".join(
+                m["menu_text"] for m in menus_payload if m.get("menu_text")
+            )
+
+            if not combined_menu_text.strip():
+                st.warning("当前未能成功抓取菜单文本，无法进行菜系画像。请检查菜单链接是否可访问。")
+            else:
+                with st.spinner("AI 正在根据菜单生成菜系画像…"):
+                    profile = analyze_menu_profile(combined_menu_text)
+
+                if "error" in profile:
+                    st.error(profile["error"])
+                else:
+                    st.subheader("🔎 AI 菜系画像")
+                    st.json(profile)
+
+                    if competitors_df is None or competitors_df.empty:
+                        st.info("附近竞争对手数据不足，无法进一步筛选真正竞对。")
+                    else:
+                        with st.spinner("AI 正在基于菜系画像筛选真正的核心竞对…"):
+                            candidate_profiles = build_competitor_profiles(
+                                competitors_df, GOOGLE_API_KEY, max_n=15
+                            )
+                            ranked_competitors = rank_competitors_with_gpt(
+                                profile, candidate_profiles
+                            )
+
+                        if not ranked_competitors:
+                            st.warning("AI 未能返回有效的竞对列表，可能是信息太少或模型调用出错。")
+                        else:
+                            st.subheader("🏆 AI 判定的核心竞对（按相似度排序）")
+                            ranked_df = pd.DataFrame(ranked_competitors)
+                            st.dataframe(ranked_df, use_container_width=True)
+
     st.markdown("### 🔍 生成 ChatGPT 菜系 & 菜单 & 运营深度分析报告")
 
-    ai_btn = st.button("✨ 生成 AI 深度分析报告")
+    ai_btn = st.button("🧠 生成 AI 深度分析报告（长文版）")
 
     if ai_btn:
         st.info("已收到生成请求，正在调用 ChatGPT ...")
