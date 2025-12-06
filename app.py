@@ -1,5 +1,6 @@
 import os
 import json
+import base64
 from typing import List, Dict, Any, Optional
 
 import streamlit as st
@@ -33,7 +34,7 @@ st.write(
     "- 只需输入地址，自动匹配你的餐厅\n"
     "- 自动扫描附近竞争对手\n"
     "- 估算堂食 / 外卖的潜在流失营收\n"
-    "- 抓取官网 / 第三方平台菜单，结合 ChatGPT 做多维菜系 & 菜单结构 & 运营分析\n"
+    "- 抓取官网 / 外卖平台 / Google 菜单图片，结合 ChatGPT 做多维菜系 & 菜单结构 & 运营分析\n"
     "- 基于菜单菜系画像，自动筛选真正的核心竞对（实验功能）"
 )
 
@@ -58,9 +59,12 @@ if "candidate_places" not in st.session_state:
     st.session_state["candidate_places"] = []
 if "selected_index" not in st.session_state:
     st.session_state["selected_index"] = 0
-# 记录是否已经跑过完整分析，供 AI 按钮使用
 if "analysis_ready" not in st.session_state:
     st.session_state["analysis_ready"] = False
+
+# 保存 OCR 菜单文本（避免按钮多次点击丢失）
+if "ocr_menu_texts" not in st.session_state:
+    st.session_state["ocr_menu_texts"] = []
 
 # =========================
 # 工具函数（带缓存）
@@ -168,6 +172,83 @@ def fetch_html(url: str) -> Optional[str]:
         return r.html.html
     except Exception:
         return None
+
+# =========================
+# Google 菜单照片 & OCR
+# =========================
+
+@st.cache_data(show_spinner=False)
+def fetch_place_photo(api_key: str, photo_reference: str, maxwidth: int = 1200) -> bytes:
+    """
+    调用 Google Place Photos API，返回图片二进制。
+    注意：这里是服务器向 Google 请求，不曝光在前端。
+    """
+    url = "https://maps.googleapis.com/maps/api/place/photo"
+    params = {
+        "key": api_key,
+        "photoreference": photo_reference,
+        "maxwidth": maxwidth,
+    }
+    resp = requests.get(url, params=params, timeout=30)
+    resp.raise_for_status()
+    return resp.content
+
+
+def get_place_photos(place_detail: Dict[str, Any], max_photos: int = 12) -> List[Dict[str, Any]]:
+    """
+    从 Place Details 的 photos 字段拉一批照片出来（用于用户勾选菜单页）。
+    """
+    photos = place_detail.get("photos", []) or []
+    results: List[Dict[str, Any]] = []
+    for p in photos[:max_photos]:
+        ref = p.get("photo_reference")
+        if not ref:
+            continue
+        try:
+            img_bytes = fetch_place_photo(GOOGLE_API_KEY, ref, maxwidth=1200)
+        except Exception:
+            continue
+        results.append(
+            {
+                "photo_reference": ref,
+                "image_bytes": img_bytes,
+            }
+        )
+    return results
+
+
+def ocr_menu_from_image_bytes(img_bytes: bytes) -> str:
+    """
+    使用 OpenAI 多模态从菜单图片里提取【菜名 + 价格】文本。
+    返回的就是可以直接拼进 menu_text 的多行字符串。
+    """
+    if client is None:
+        return ""
+
+    b64 = base64.b64encode(img_bytes).decode("utf-8")
+    data_url = f"data:image/jpeg;base64,{b64}"
+
+    prompt = (
+        "这是一张餐厅菜单的照片。请帮我识别出**菜品名称和价格**，"
+        "按每行一个菜输出，格式：`原文菜名 - 英文名(如果有) - 价格`。"
+        "如果没有英文名就留空；如果有多种规格，可以拆成多行。不要输出解释文字，只输出菜单条目。"
+    )
+
+    resp = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    {"type": "input_image", "image_url": data_url},
+                ],
+            }
+        ],
+        temperature=0.1,
+    )
+    text = resp.choices[0].message.content or ""
+    return text.strip()
 
 # =========================
 # 评分 & 计算函数
@@ -598,7 +679,7 @@ def rank_competitors_with_gpt(
 # ChatGPT 深度分析函数
 # =========================
 
-def call_llm_safe(messages: List[Dict[str, str]]) -> str:
+def call_llm_safe(messages: List[Dict[str, Any]]) -> str:
     if client is None:
         return "未配置 OPENAI_API_KEY，无法调用 ChatGPT，请在 Streamlit Secrets 中添加 OPENAI_API_KEY。"
     try:
@@ -609,7 +690,6 @@ def call_llm_safe(messages: List[Dict[str, str]]) -> str:
         )
         return completion.choices[0].message.content
     except Exception as e:
-        # fallback + 带上错误信息
         try:
             completion = client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -761,7 +841,7 @@ candidate_places = st.session_state["candidate_places"]
 selected_place_id: Optional[str] = None
 place_label_list: List[str] = []
 
-run_btn = False  # 默认 False，避免未定义
+run_btn = False
 
 if candidate_places:
     st.markdown("## 2️⃣ 选择你的餐厅 & 填写关键业务参数")
@@ -821,15 +901,13 @@ if candidate_places:
 
     run_btn = st.button("🚀 运行分析")
 
-    # 只要点过一次“运行分析”，就记下来，后面点 AI 按钮也能复用分析逻辑
     if run_btn:
         st.session_state["analysis_ready"] = True
-
 else:
     st.info("先输入地址并点击“根据地址查找附近餐厅”。")
 
 # =========================
-# 3️⃣ 主分析逻辑（运行分析按钮 or 已经分析过）
+# 3️⃣ 主分析逻辑
 # =========================
 
 if candidate_places and selected_place_id and (
@@ -984,12 +1062,58 @@ if candidate_places and selected_place_id and (
         "- 60 分以上：相对健康，可以开始玩精细化运营和活动。"
     )
 
-    st.markdown("## 8️⃣ 菜单抓取 & ChatGPT 菜系 / 菜单结构分析")
+    # =============================
+    # 8️⃣ Google 菜单照片 OCR
+    # =============================
+    st.markdown("## 8️⃣ Google 菜单图片 → OCR 提取菜品及价格（可选）")
+
+    photo_items = get_place_photos(place_detail, max_photos=12)
+    selected_flags = []
+
+    if photo_items:
+        st.write("从 Google 照片中挑选看起来是菜单的图片，勾选后再点击 OCR 按钮。")
+        cols = st.columns(4)
+        for i, item in enumerate(photo_items):
+            with cols[i % 4]:
+                st.image(item["image_bytes"], use_column_width=True)
+                selected = st.checkbox("菜单", key=f"menu_photo_{i}")
+                selected_flags.append(selected)
+
+        ocr_btn = st.button("🧾 对勾选图片做 OCR 并提取菜单文本")
+        if ocr_btn:
+            if client is None:
+                st.error("未配置 OPENAI_API_KEY，无法进行 OCR。")
+            else:
+                ocr_results = []
+                with st.spinner("AI 正在识别菜单图片中的菜名和价格…"):
+                    for flag, item in zip(selected_flags, photo_items):
+                        if not flag:
+                            continue
+                        text = ocr_menu_from_image_bytes(item["image_bytes"])
+                        if text:
+                            ocr_results.append(text)
+
+                if ocr_results:
+                    st.session_state["ocr_menu_texts"] = ocr_results
+                    st.success(f"OCR 成功，从图片中提取出 {len(ocr_results)} 段菜单文本。")
+                    for idx, txt in enumerate(ocr_results, start=1):
+                        st.markdown(f"**OCR 菜单 #{idx}：**")
+                        st.code(txt, language="text")
+                else:
+                    st.warning("没有从勾选的图片中识别出有效菜单文本。")
+    else:
+        st.info("当前餐厅的 Google Place 资料中没有图片，或不足以用于菜单识别。")
+
+    # =============================
+    # 9️⃣ 菜单抓取（官网/外卖链接）+ 合并 OCR 菜单
+    # =============================
+
+    st.markdown("## 9️⃣ 菜单抓取 & ChatGPT 菜系 / 菜单结构分析")
 
     auto_menu_urls = discover_menu_urls(place_detail, website_html)
     auto_menu_urls_str = "\n".join(auto_menu_urls)
 
-    st.markdown("#### 菜单抓取预览（可手动增删链接）")
+    st.markdown("#### 菜单链接抓取（可手动增删）")
     menu_urls_input = st.text_area(
         "系统自动发现的菜单/点餐链接（每行一个，可自行增删）",
         auto_menu_urls_str,
@@ -1019,7 +1143,19 @@ if candidate_places and selected_place_id and (
     else:
         st.info("当前没有可用的菜单链接，AI 分析将主要基于 Google 资料和官网内容。")
 
-    # ========== 新增：基于菜单菜系画像的精准竞对模块 ==========
+    # 把 OCR 出来的菜单文本也塞进 menus_payload（作为额外来源）
+    ocr_texts = st.session_state.get("ocr_menu_texts", [])
+    for idx, txt in enumerate(ocr_texts, start=1):
+        menus_payload.append(
+            {
+                "source": f"google_menu_photo_{idx}",
+                "url": "",
+                "status": "ocr_ok",
+                "menu_text": txt,
+            }
+        )
+
+    # ========== 基于菜单菜系画像的精准竞对模块 ==========
     st.markdown("### 🍜 基于菜单菜系画像的精准竞对（实验功能）")
 
     ai_comp_btn = st.button("✨ 生成菜系画像 + 精准竞对列表")
@@ -1028,13 +1164,11 @@ if candidate_places and selected_place_id and (
         if client is None:
             st.error("未配置 OPENAI_API_KEY，无法进行菜系画像和竞对筛选。")
         else:
-            # 汇总所有菜单文本
-            combined_menu_text = "\n".join(
-                m["menu_text"] for m in menus_payload if m.get("menu_text")
-            )
+            combined_menu_text_parts = [m["menu_text"] for m in menus_payload if m.get("menu_text")]
+            combined_menu_text = "\n".join(combined_menu_text_parts)
 
             if not combined_menu_text.strip():
-                st.warning("当前未能成功抓取菜单文本，无法进行菜系画像。请检查菜单链接是否可访问。")
+                st.warning("当前未能成功获取任何菜单文本，无法进行菜系画像。请检查菜单链接或菜单图片 OCR。")
             else:
                 with st.spinner("AI 正在根据菜单生成菜系画像…"):
                     profile = analyze_menu_profile(combined_menu_text)
@@ -1063,9 +1197,9 @@ if candidate_places and selected_place_id and (
                             ranked_df = pd.DataFrame(ranked_competitors)
                             st.dataframe(ranked_df, use_container_width=True)
 
-    st.markdown("### 🔍 生成 ChatGPT 菜系 & 菜单 & 运营深度分析报告")
+    st.markdown("### 🧠 生成 ChatGPT 菜系 & 菜单 & 运营深度分析报告")
 
-    ai_btn = st.button("🧠 生成 AI 深度分析报告（长文版）")
+    ai_btn = st.button("📊 生成 AI 深度分析报告（长文版）")
 
     if ai_btn:
         st.info("已收到生成请求，正在调用 ChatGPT ...")
@@ -1075,7 +1209,7 @@ if candidate_places and selected_place_id and (
         else:
             import traceback
 
-            with st.spinner("正在调用 ChatGPT 生成分析报告，大概需要几秒钟..."):
+            with st.spinner("正在调用 ChatGPT 生成分析报告…"):
                 try:
                     ai_report = llm_deep_analysis(
                         place_detail=place_detail,
@@ -1093,7 +1227,7 @@ if candidate_places and selected_place_id and (
                     st.error(f"调用 ChatGPT 时发生未捕获错误：{e}")
                     st.code(traceback.format_exc())
 
-    st.markdown("## 9️⃣ 免费获取完整诊断报告 & 1 对 1 咨询")
+    st.markdown("## 🔟 免费获取完整诊断报告 & 1 对 1 咨询")
 
     st.markdown(
         """
