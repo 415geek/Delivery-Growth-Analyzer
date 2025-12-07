@@ -43,6 +43,7 @@ GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY", "")
 SERPAPI_KEY = st.secrets.get("SERPAPI_KEY", "")
 YELP_API_KEY = st.secrets.get("YELP_API_KEY", "")
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")
+SCRAPERAPI_KEY = st.secrets.get("SCRAPERAPI_KEY", "")
 
 if not GOOGLE_API_KEY:
     st.error("缺少 GOOGLE_API_KEY，请先在 Streamlit Secrets 中配置后再刷新。")
@@ -136,12 +137,46 @@ def serpapi_google_maps_search(
     return resp.json()
 
 
+# =========================
+# ScraperAPI 集成
+# =========================
+
+@st.cache_data(show_spinner=False)
+def fetch_html_via_scraperapi(url: str, render: bool = True) -> Optional[str]:
+    """
+    通过 ScraperAPI 抓取页面，自动绕过大部分反爬 & Cloudflare。
+    render=True 会启用 JS 渲染，适合 order.online / Doordash 这类 SPA。
+    """
+    if not SCRAPERAPI_KEY:
+        return None
+
+    api_endpoint = "https://api.scraperapi.com"
+    params = {
+        "api_key": SCRAPERAPI_KEY,
+        "url": url,
+    }
+    if render:
+        params["render"] = "true"
+
+    try:
+        resp = requests.get(api_endpoint, params=params, timeout=40)
+        resp.raise_for_status()
+        ctype = resp.headers.get("Content-Type", "")
+        if "text/html" in ctype or "application/json" in ctype:
+            return resp.text
+        return None
+    except Exception:
+        return None
+
+
 @st.cache_data(show_spinner=False)
 def fetch_html(url: str) -> Optional[str]:
     """
-    先用普通 requests 抓一次；
-    如果失败，并且环境支持 requests_html，再尝试 headless 渲染。
-    很多点餐站点会反爬，这里失败就返回 None。
+    统一页面抓取逻辑：
+    1）遇到典型强 JS/反爬域名（Doordash/order.online 等）优先走 ScraperAPI；
+    2）普通请求试一次；
+    3）失败再走 ScraperAPI；
+    4）再失败用本地 headless（requests_html）兜底。
     """
     headers = {
         "User-Agent": (
@@ -152,16 +187,48 @@ def fetch_html(url: str) -> Optional[str]:
         "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8",
     }
 
-    # 普通请求
+    hard_domains = [
+        "doordash.com",
+        "ubereats.com",
+        "grubhub.com",
+        "order.online",
+        "hungrypanda.co",
+        "fantuan.ca",
+        "chownow.com",
+    ]
+    lower_url = url.lower()
+
+    # 0️⃣ 某些第三方点餐网站直接走 ScraperAPI + JS 渲染
+    if any(d in lower_url for d in hard_domains):
+        html = fetch_html_via_scraperapi(url, render=True)
+        if html:
+            return html
+
+    # 1️⃣ 普通请求（适合自家官网、简单点餐站）
     try:
         resp = requests.get(url, headers=headers, timeout=15)
         ctype = resp.headers.get("Content-Type", "")
-        if resp.status_code < 400 and "text/html" in ctype:
-            return resp.text
+        body = resp.text
+
+        blocked = (
+            resp.status_code >= 400
+            or "captcha" in body.lower()
+            or "access denied" in body.lower()
+            or "temporarily blocked" in body.lower()
+        )
+
+        if resp.status_code < 400 and "text/html" in ctype and not blocked:
+            return body
     except Exception:
         pass
 
-    # headless 渲染（可选）
+    # 2️⃣ 普通请求失败 → ScraperAPI（渲染打开）
+    if SCRAPERAPI_KEY:
+        html = fetch_html_via_scraperapi(url, render=True)
+        if html:
+            return html
+
+    # 3️⃣ 再失败 → requests_html headless 渲染（如果可用）
     if not HAS_REQUESTS_HTML:
         return None
 
@@ -196,7 +263,7 @@ def fetch_place_photo(api_key: str, photo_reference: str, maxwidth: int = 1200) 
 def classify_menu_image(img_bytes: bytes) -> str:
     """
     使用 GPT 多模态判断图片类型：
-    返回值:
+    返回：
       - "menu_page"           明显是菜牌/菜单页面
       - "food_dish"           单道菜/几道菜的摆盘照片
       - "storefront_or_other" 店招、Logo、环境、人像等
@@ -1151,7 +1218,7 @@ if candidate_places and selected_place_id and (
     # =============================
     # 8️⃣ Google 菜单图片 → 自动 OCR
     # =============================
-    st.markdown("## 8️⃣ Google 菜单图片 → 自动 OCR 提取菜品及价格")
+    st.markdown("## 8️⃣ Google 菜单图片 → 自动 OCR 提取菜品及价格（可选）")
 
     menu_photos = get_place_photos(place_detail, max_photos=20)
 
