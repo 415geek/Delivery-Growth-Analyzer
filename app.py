@@ -34,7 +34,7 @@ st.write(
     "- 只需输入地址，自动匹配你的餐厅\n"
     "- 自动扫描附近竞争对手\n"
     "- 估算堂食 / 外卖的潜在流失营收\n"
-    "- 抓取官网 / 外卖平台 / Google 菜单图片，结合 AI 做多维菜系 & 菜单结构 & 运营分析\n"
+    "- 抓取官网 / 外卖平台菜单 + Google 菜单图片，结合 ChatGPT 做多维菜系 & 菜单结构 & 运营分析\n"
     "- 基于菜单菜系画像，自动筛选真正的核心竞对（实验功能）"
 )
 
@@ -61,8 +61,6 @@ if "selected_index" not in st.session_state:
     st.session_state["selected_index"] = 0
 if "analysis_ready" not in st.session_state:
     st.session_state["analysis_ready"] = False
-
-# 保存 OCR 菜单文本（避免按钮多次点击丢失）
 if "ocr_menu_texts" not in st.session_state:
     st.session_state["ocr_menu_texts"] = []
 
@@ -143,6 +141,7 @@ def fetch_html(url: str) -> Optional[str]:
     """
     先用普通 requests 抓一次；
     如果失败，并且环境支持 requests_html，再尝试 headless 渲染。
+    很多点餐站点会反爬，这里失败就返回 None。
     """
     headers = {
         "User-Agent": (
@@ -156,7 +155,8 @@ def fetch_html(url: str) -> Optional[str]:
     # 普通请求
     try:
         resp = requests.get(url, headers=headers, timeout=15)
-        if resp.status_code < 400 and "text/html" in resp.headers.get("Content-Type", ""):
+        ctype = resp.headers.get("Content-Type", "")
+        if resp.status_code < 400 and "text/html" in ctype:
             return resp.text
     except Exception:
         pass
@@ -181,7 +181,6 @@ def fetch_html(url: str) -> Optional[str]:
 def fetch_place_photo(api_key: str, photo_reference: str, maxwidth: int = 1200) -> bytes:
     """
     调用 Google Place Photos API，返回图片二进制。
-    注意：这里是服务器向 Google 请求，不曝光在前端。
     """
     url = "https://maps.googleapis.com/maps/api/place/photo"
     params = {
@@ -194,26 +193,90 @@ def fetch_place_photo(api_key: str, photo_reference: str, maxwidth: int = 1200) 
     return resp.content
 
 
-def get_place_photos(place_detail: Dict[str, Any], max_photos: int = 12) -> List[Dict[str, Any]]:
+def classify_menu_image(img_bytes: bytes) -> str:
     """
-    从 Place Details 的 photos 字段拉一批照片出来（用于用户勾选菜单页）。
+    使用 GPT 多模态判断图片类型：
+    返回值:
+      - "menu_page"           明显是菜牌/菜单页面
+      - "food_dish"           单道菜/几道菜的摆盘照片
+      - "storefront_or_other" 店招、Logo、环境、人像等
+    """
+    if client is None:
+        return "storefront_or_other"
+
+    b64 = base64.b64encode(img_bytes).decode("utf-8")
+    data_url = f"data:image/jpeg;base64,{b64}"
+
+    prompt = """
+你是一名餐饮图片识别助手，请只根据图片内容判断图片类型，不要做其他事情。
+
+请从下面三种类型中选一个，并只输出对应的英文代码（不要加解释）：
+
+1. 如果图片主要内容是「菜单/菜牌页面」，特征包括：
+   - 有成列的菜品名称、描述和价格
+   - 看起来像打印出来的 menu / laminated menu / 手写菜单板
+   - 可能是一页或多页菜单的照片
+   请输出：menu_page
+
+2. 如果图片主要内容是「一盘或几盘菜、饮品」，特征包括：
+   - 看得到实际食物/饮料摆盘
+   - 没有成列的菜单条目和价格
+   请输出：food_dish
+
+3. 如果图片主要内容是「店招、门面、Logo、环境、人像、街景等」，而不是菜单或菜品特写，
+   请输出：storefront_or_other
+
+重要规则：
+- 只输出以上三种之一的英文代码，不要输出任何说明文字。
+"""
+
+    resp = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }
+        ],
+        temperature=0.0,
+    )
+    label = (resp.choices[0].message.content or "").strip().lower()
+    if label not in {"menu_page", "food_dish", "storefront_or_other"}:
+        return "storefront_or_other"
+    return label
+
+
+def get_place_photos(place_detail: Dict[str, Any], max_photos: int = 20) -> List[Dict[str, Any]]:
+    """
+    从 Place Details 中获取照片，并自动筛选出“菜单页”优先返回。
     """
     photos = place_detail.get("photos", []) or []
     results: List[Dict[str, Any]] = []
+    if not photos:
+        return results
+
     for p in photos[:max_photos]:
         ref = p.get("photo_reference")
         if not ref:
             continue
         try:
-            img_bytes = fetch_place_photo(GOOGLE_API_KEY, ref, maxwidth=1200)
+            img_bytes = fetch_place_photo(GOOGLE_API_KEY, ref, maxwidth=1000)
         except Exception:
             continue
-        results.append(
-            {
-                "photo_reference": ref,
-                "image_bytes": img_bytes,
-            }
-        )
+
+        label = classify_menu_image(img_bytes)
+        if label == "menu_page":
+            results.append(
+                {
+                    "photo_reference": ref,
+                    "image_bytes": img_bytes,
+                    "label": label,
+                }
+            )
+
     return results
 
 
@@ -257,7 +320,6 @@ def ocr_menu_from_image_bytes(img_bytes: bytes) -> str:
 - 如果最后判断属于第 3 种情况，就返回空字符串。
 """
 
-    # 注意：这里用的是新版多模态 content 结构
     resp = client.chat.completions.create(
         model="gpt-4.1-mini",
         messages=[
@@ -265,10 +327,7 @@ def ocr_menu_from_image_bytes(img_bytes: bytes) -> str:
                 "role": "user",
                 "content": [
                     {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": data_url},
-                    },
+                    {"type": "image_url", "image_url": {"url": data_url}},
                 ],
             }
         ],
@@ -650,7 +709,7 @@ def rank_competitors_with_gpt(
     candidates: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     """
-    让 系统 在候选餐厅中挑出真正的 5–10 家核心竞对，并按相似度排序。
+    让 ChatGPT 在候选餐厅中挑出真正的 5–10 家核心竞对，并按相似度排序。
     """
     if client is None:
         return []
@@ -661,7 +720,7 @@ def rank_competitors_with_gpt(
 请你从候选中选出最像的 5-10 家竞对，并按相似度从高到低排序。
 
 相似度判断维度包括：
-- 菜系或菜品 / 类别是否接近（比如都是川菜、粤菜、港式茶餐厅等）
+- 菜系 / 类别是否接近（比如都是川菜、粤菜、港式茶餐厅等）
 - 价格带是否接近
 - 是否属于相似业态（正餐/快餐/茶餐厅/奶茶店/烘焙店）
 - 若信息有限，可根据分类 types 和餐厅名称做合理推断
@@ -907,7 +966,7 @@ if candidate_places:
     st.markdown("### 关键词 & 搜索量（不懂就用默认值）")
 
     keywords_input = st.text_input(
-        "特色菜品或品牌核心关键词（逗号分隔）",
+        "核心关键词（逗号分隔）",
         "best chinese food, best asian food, best baked chicken",
         help="用于估算你在 Google 本地搜索里的机会。不懂就用默认值。",
     )
@@ -1090,46 +1149,42 @@ if candidate_places and selected_place_id and (
     )
 
     # =============================
-    # 8️⃣ Google 菜单照片 OCR
+    # 8️⃣ Google 菜单图片 → 自动 OCR
     # =============================
-    st.markdown("## 8️⃣ Google 菜单图片 → OCR 提取菜品及价格（可选）")
+    st.markdown("## 8️⃣ Google 菜单图片 → 自动 OCR 提取菜品及价格")
 
-    photo_items = get_place_photos(place_detail, max_photos=12)
-    selected_flags = []
+    menu_photos = get_place_photos(place_detail, max_photos=20)
 
-    if photo_items:
-        st.write("从 Google 照片中挑选看起来是菜单的图片，勾选后再点击 OCR 按钮。")
+    if not menu_photos:
+        st.info("没有从 Google 图片中自动识别出菜单页，将跳过图片 OCR。")
+    else:
+        st.write(f"已从 Google 图片中自动识别出 {len(menu_photos)} 张可能是菜单页的图片：")
         cols = st.columns(4)
-        for i, item in enumerate(photo_items):
+        for i, item in enumerate(menu_photos):
             with cols[i % 4]:
                 st.image(item["image_bytes"], use_column_width=True)
-                selected = st.checkbox("菜单", key=f"menu_photo_{i}")
-                selected_flags.append(selected)
 
-        ocr_btn = st.button("🧾 对勾选图片做 OCR 并提取菜单文本")
-        if ocr_btn:
+        auto_ocr_btn = st.button("🧾 自动对菜单页做 OCR 并提取菜单文本")
+
+        if auto_ocr_btn:
             if client is None:
                 st.error("未配置 OPENAI_API_KEY，无法进行 OCR。")
             else:
                 ocr_results = []
-                with st.spinner("AI 正在识别菜单图片中的菜名和价格…"):
-                    for flag, item in zip(selected_flags, photo_items):
-                        if not flag:
-                            continue
+                with st.spinner("AI 正在识别菜单页中的菜名和价格…"):
+                    for item in menu_photos:
                         text = ocr_menu_from_image_bytes(item["image_bytes"])
                         if text:
                             ocr_results.append(text)
 
                 if ocr_results:
                     st.session_state["ocr_menu_texts"] = ocr_results
-                    st.success(f"OCR 成功，从图片中提取出 {len(ocr_results)} 段菜单文本。")
+                    st.success(f"从菜单页图片中提取出 {len(ocr_results)} 段菜单文本。")
                     for idx, txt in enumerate(ocr_results, start=1):
                         st.markdown(f"**OCR 菜单 #{idx}：**")
                         st.code(txt, language="text")
                 else:
-                    st.warning("没有从勾选的图片中识别出有效菜单或菜品。")
-    else:
-        st.info("当前餐厅的 Google Place 资料中没有图片，或不足以用于菜单识别。")
+                    st.warning("自动识别的菜单页中没有提取出有效菜单文本。")
 
     # =============================
     # 9️⃣ 菜单抓取（官网/外卖链接）+ 合并 OCR 菜单
